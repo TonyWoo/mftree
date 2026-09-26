@@ -10,7 +10,7 @@ repository = "https://github.com/tonywoo/mftree"
 eframe = "0.36"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO"] }
 
 [profile.release]
 opt-level = 3

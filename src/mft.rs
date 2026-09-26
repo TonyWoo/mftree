@@ -68,7 +68,7 @@ mod imp {
                     std::ptr::null(),
                     OPEN_EXISTING,
                     0,
-                    0,
+                    std::ptr::null_mut(),
                 )
             };
             if h == INVALID_HANDLE_VALUE {
@@ -309,7 +309,7 @@ mod imp {
         let mut mft =
             Vec::with_capacity((total_clusters * cluster).min(512 * 1024 * 1024) as usize);
         for (lcn, ncl) in &runs {
-            mft.extend_from_slice(&vol.read_at(lcn * cluster, ncl * cluster as usize)?);
+            mft.extend_from_slice(&vol.read_at(*lcn * cluster, (*ncl * cluster) as usize)?);
         }
         drop(vol);
 
