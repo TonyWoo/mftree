@@ -23,8 +23,8 @@ mod imp {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, GetLogicalDriveStringsW, ReadFile, SetFilePointerEx, FILE_BEGIN,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        CreateFileW, GetDiskFreeSpaceExW, GetLogicalDriveStringsW, ReadFile, SetFilePointerEx,
+        FILE_BEGIN, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
 
     const GENERIC_READ: u32 = 0x8000_0000;
@@ -50,6 +50,27 @@ mod imp {
             out.push("C:".to_string());
         }
         out
+    }
+
+    /// Returns (total_bytes, free_bytes) for the volume.
+    pub fn disk_space(drive: &str) -> Result<(u64, u64), String> {
+        let root = format!(r"{}:\", drive.trim_end_matches(':'));
+        let wide: Vec<u16> = OsStr::new(&root).encode_wide().chain(Some(0)).collect();
+        let mut free_to_caller = 0u64;
+        let mut total = 0u64;
+        let mut total_free = 0u64;
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut free_to_caller,
+                &mut total,
+                &mut total_free,
+            )
+        };
+        if ok == 0 {
+            return Err("GetDiskFreeSpaceExW failed".to_string());
+        }
+        Ok((total, total_free))
     }
 
     struct Volume {
@@ -437,6 +458,21 @@ mod imp {
         vec!["/".to_string()]
     }
 
+    /// Returns (total_bytes, free_bytes) for the mount point.
+    pub fn disk_space(drive: &str) -> Result<(u64, u64), String> {
+        use std::ffi::CString;
+        let c = CString::new(drive).map_err(|e| e.to_string())?;
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        let r = unsafe { libc::statvfs(c.as_ptr(), &mut st) };
+        if r != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok((
+            st.f_blocks as u64 * st.f_frsize as u64,
+            st.f_bavail as u64 * st.f_frsize as u64,
+        ))
+    }
+
     pub fn scan(drive: &str, progress: &dyn Fn(u64) -> bool) -> Result<Vec<FileEntry>, String> {
         let mut files: Vec<(PathBuf, u64)> = Vec::new();
         let mut stack = vec![PathBuf::from(drive)];
@@ -491,4 +527,4 @@ mod imp {
     }
 }
 
-pub use imp::{list_drives, scan};
+pub use imp::{disk_space, list_drives, scan};
