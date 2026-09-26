@@ -296,7 +296,7 @@ mod imp {
         })
     }
 
-    pub fn scan(drive: &str, progress: &dyn Fn(u64)) -> Result<Vec<FileEntry>, String> {
+    pub fn scan(drive: &str, progress: &dyn Fn(u64) -> bool) -> Result<Vec<FileEntry>, String> {
         let vol = Volume::open(drive)?;
         let bs = vol.read_at(0, 512)?;
         let (bps, spc, mft_lcn, rec_size) = parse_bootsector(&bs)?;
@@ -316,8 +316,8 @@ mod imp {
         let nrec = mft.len() / rec_size;
         let mut raws: HashMap<u64, RawEntry> = HashMap::with_capacity(nrec / 2);
         for (i, chunk) in mft.chunks_exact(rec_size).enumerate() {
-            if i % 4096 == 0 {
-                progress(i as u64);
+            if i % 4096 == 0 && !progress(i as u64) {
+                return Err("cancelled".to_string());
             }
             if let Some(e) = parse_record(chunk, bps) {
                 raws.insert(i as u64, e);
@@ -437,7 +437,7 @@ mod imp {
         vec!["/".to_string()]
     }
 
-    pub fn scan(drive: &str, progress: &dyn Fn(u64)) -> Result<Vec<FileEntry>, String> {
+    pub fn scan(drive: &str, progress: &dyn Fn(u64) -> bool) -> Result<Vec<FileEntry>, String> {
         let mut files: Vec<(PathBuf, u64)> = Vec::new();
         let mut stack = vec![PathBuf::from(drive)];
         let mut count = 0u64;
@@ -456,8 +456,8 @@ mod imp {
                     stack.push(p);
                 } else {
                     count += 1;
-                    if count.is_multiple_of(4096) {
-                        progress(count);
+                    if count.is_multiple_of(4096) && !progress(count) {
+                        return Err("cancelled".to_string());
                     }
                     files.push((p, md.len()));
                 }
