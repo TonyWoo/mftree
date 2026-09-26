@@ -44,14 +44,16 @@ fn short_name(path: &str) -> &str {
 }
 
 fn color_for(path: &str) -> egui::Color32 {
-    let ext = short_name(path).rsplit('.').next().unwrap_or("").to_lowercase();
+    let ext = short_name(path)
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
     match ext.as_str() {
         "mp4" | "mkv" | "avi" | "mov" | "wmv" | "flv" | "webm" => {
             egui::Color32::from_rgb(226, 90, 90)
         }
-        "mp3" | "flac" | "wav" | "aac" | "ogg" | "m4a" => {
-            egui::Color32::from_rgb(230, 150, 60)
-        }
+        "mp3" | "flac" | "wav" | "aac" | "ogg" | "m4a" => egui::Color32::from_rgb(230, 150, 60),
         "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "tiff" | "heic" => {
             egui::Color32::from_rgb(90, 178, 90)
         }
@@ -124,7 +126,11 @@ impl App {
             });
             let items = r.map(|v| {
                 v.into_iter()
-                    .map(|e| Item { path: e.path, size: e.size, is_dir: e.is_dir })
+                    .map(|e| Item {
+                        path: e.path,
+                        size: e.size,
+                        is_dir: e.is_dir,
+                    })
                     .collect::<Vec<_>>()
             });
             let _ = tx.send(ScanMsg::Done(items));
@@ -147,10 +153,13 @@ impl App {
         if let Some(r) = done {
             self.scanning = false;
             self.rx = None;
-            self.scan_secs = self.started.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+            self.scan_secs = self
+                .started
+                .map(|t| t.elapsed().as_secs_f64())
+                .unwrap_or(0.0);
             match r {
                 Ok(mut items) => {
-                    items.sort_by(|a, b| b.size.cmp(&a.size));
+                    items.sort_by_key(|a| std::cmp::Reverse(a.size));
                     self.total_size = items.iter().filter(|i| !i.is_dir).map(|i| i.size).sum();
                     self.dirs = items.iter().filter(|i| i.is_dir).cloned().collect();
                     self.files = items.into_iter().filter(|i| !i.is_dir).collect();

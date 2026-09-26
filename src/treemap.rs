@@ -23,7 +23,12 @@ pub fn squarify(weights: &[f64], x: f64, y: f64, w: f64, h: f64) -> Vec<TreemapR
         .collect();
     // keep input order but squarify works best descending; caller sorts.
     let mut rects = vec![
-        TreemapRect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+        TreemapRect {
+            x: 0.0,
+            y: 0.0,
+            w: 0.0,
+            h: 0.0
+        };
         weights.len()
     ];
 
@@ -66,7 +71,12 @@ pub fn squarify(weights: &[f64], x: f64, y: f64, w: f64, h: f64) -> Vec<TreemapR
             let mut rx = *cx;
             for &(i, a) in row {
                 let rw = a / rh;
-                rects[i] = TreemapRect { x: rx, y: *cy, w: rw, h: rh };
+                rects[i] = TreemapRect {
+                    x: rx,
+                    y: *cy,
+                    w: rw,
+                    h: rh,
+                };
                 rx += rw;
             }
             *cy += rh;
@@ -76,7 +86,12 @@ pub fn squarify(weights: &[f64], x: f64, y: f64, w: f64, h: f64) -> Vec<TreemapR
             let mut ry = *cy;
             for &(i, a) in row {
                 let rh = a / rw;
-                rects[i] = TreemapRect { x: *cx, y: ry, w: rw, h: rh };
+                rects[i] = TreemapRect {
+                    x: *cx,
+                    y: ry,
+                    w: rw,
+                    h: rh,
+                };
                 ry += rh;
             }
             *cx += rw;

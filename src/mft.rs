@@ -82,8 +82,14 @@ mod imp {
             let mut done = 0usize;
             while done < size {
                 let chunk = (size - done).min(64 * 1024 * 1024) as u32;
-                let ok =
-                    unsafe { SetFilePointerEx(self.h, (offset + done as u64) as i64, std::ptr::null_mut(), FILE_BEGIN) };
+                let ok = unsafe {
+                    SetFilePointerEx(
+                        self.h,
+                        (offset + done as u64) as i64,
+                        std::ptr::null_mut(),
+                        FILE_BEGIN,
+                    )
+                };
                 if ok == 0 {
                     return Err("seek failed".into());
                 }
@@ -122,7 +128,13 @@ mod imp {
     }
     fn u64_at(b: &[u8], off: usize) -> u64 {
         u64::from_le_bytes([
-            b[off], b[off + 1], b[off + 2], b[off + 3], b[off + 4], b[off + 5], b[off + 6],
+            b[off],
+            b[off + 1],
+            b[off + 2],
+            b[off + 3],
+            b[off + 4],
+            b[off + 5],
+            b[off + 6],
             b[off + 7],
         ])
     }
@@ -276,7 +288,12 @@ mod imp {
             }
         });
         let (name, parent) = name?;
-        Some(RawEntry { name, parent, size, is_dir })
+        Some(RawEntry {
+            name,
+            parent,
+            size,
+            is_dir,
+        })
     }
 
     pub fn scan(drive: &str, progress: &dyn Fn(u64)) -> Result<Vec<FileEntry>, String> {
@@ -289,7 +306,8 @@ mod imp {
         let runs = mft_runs(&rec0)?;
 
         let total_clusters: u64 = runs.iter().map(|(_, n)| n).sum();
-        let mut mft = Vec::with_capacity((total_clusters * cluster).min(512 * 1024 * 1024) as usize);
+        let mut mft =
+            Vec::with_capacity((total_clusters * cluster).min(512 * 1024 * 1024) as usize);
         for (lcn, ncl) in &runs {
             mft.extend_from_slice(&vol.read_at(lcn * cluster, ncl * cluster as usize)?);
         }
@@ -390,8 +408,16 @@ mod imp {
         let mut memo = HashMap::new();
         let mut out = Vec::with_capacity(raws.len());
         for (&num, e) in &raws {
-            let size = if e.is_dir { total.get(&num).copied().unwrap_or(e.size) } else { e.size };
-            out.push(FileEntry { path: path_of(num, &raws, drive, &mut memo), size, is_dir: e.is_dir });
+            let size = if e.is_dir {
+                total.get(&num).copied().unwrap_or(e.size)
+            } else {
+                e.size
+            };
+            out.push(FileEntry {
+                path: path_of(num, &raws, drive, &mut memo),
+                size,
+                is_dir: e.is_dir,
+            });
         }
         Ok(out)
     }
@@ -430,7 +456,7 @@ mod imp {
                     stack.push(p);
                 } else {
                     count += 1;
-                    if count % 4096 == 0 {
+                    if count.is_multiple_of(4096) {
                         progress(count);
                     }
                     files.push((p, md.len()));
@@ -447,10 +473,18 @@ mod imp {
         }
         let mut out: Vec<FileEntry> = files
             .into_iter()
-            .map(|(p, s)| FileEntry { path: p.to_string_lossy().into_owned(), size: s, is_dir: false })
+            .map(|(p, s)| FileEntry {
+                path: p.to_string_lossy().into_owned(),
+                size: s,
+                is_dir: false,
+            })
             .collect();
         for (p, s) in dir_size {
-            out.push(FileEntry { path: p.to_string_lossy().into_owned(), size: s, is_dir: true });
+            out.push(FileEntry {
+                path: p.to_string_lossy().into_owned(),
+                size: s,
+                is_dir: true,
+            });
         }
         progress(count);
         Ok(out)

@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+  build-test:
+    name: build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux GUI deps
+        if: runner.os == 'Linux'
+        run: >
+          sudo apt-get update &&
+          sudo apt-get install -y
+          libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+          libxkbcommon-dev libxkbcommon-x11-0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build
+        run: cargo build --locked
+      - name: test
+        run: cargo test --locked
