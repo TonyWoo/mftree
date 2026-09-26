@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux GUI deps
+        if: runner.os == 'Linux'
+        run: >
+          sudo apt-get update &&
+          sudo apt-get install -y
+          libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+          libxkbcommon-dev libxkbcommon-x11-0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build release
+        run: cargo build --release --locked
+      - name: package (Windows)
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path target/release/mftree.exe -DestinationPath mftree-windows-x86_64.zip
+      - name: package (Linux)
+        if: runner.os == 'Linux'
+        run: zip -j mftree-linux-x86_64.zip target/release/mftree
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ runner.os }}-bin
+          path: mftree-*.zip
+
+  release:
+    name: create release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true
