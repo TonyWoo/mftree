@@ -267,7 +267,8 @@ mod imp {
     }
 
     fn parse_filename(attr: &[u8]) -> Option<(String, u64)> {
-        let coff = u16_at(attr, 0x12) as usize;
+        // resident attribute: content offset is a u16 at header offset 0x14
+        let coff = u16_at(attr, 0x14) as usize;
         let c = attr.get(coff..)?;
         let parent = u64_at(c, 0) & 0xFFFF_FFFF_FFFF;
         let nlen = *c.get(0x40)? as usize;
@@ -441,6 +442,58 @@ mod imp {
             });
         }
         Ok(out)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn le16(v: u16) -> [u8; 2] {
+            v.to_le_bytes()
+        }
+        fn le32(v: u32) -> [u8; 4] {
+            v.to_le_bytes()
+        }
+
+        /// Build a minimal resident $FILE_NAME attribute for `name` with the
+        /// given parent MFT record number.
+        fn fake_filename_attr(name: &str, parent: u64) -> Vec<u8> {
+            let name_utf16: Vec<u16> = name.encode_utf16().collect();
+            let content_off = 0x18usize;
+            let content_len = 0x42 + name_utf16.len() * 2;
+            let total_len = (content_off + content_len) as u32;
+            let mut attr = vec![0u8; content_off + content_len];
+            attr[0..4].copy_from_slice(&le32(0x30)); // type = $FILE_NAME
+            attr[4..8].copy_from_slice(&le32(total_len));
+            attr[8] = 0; // resident
+            attr[0x10..0x14].copy_from_slice(&le32(content_len as u32));
+            attr[0x14..0x16].copy_from_slice(&le16(content_off as u16));
+            let c = content_off;
+            attr[c..c + 6].copy_from_slice(&parent.to_le_bytes()[..6]);
+            attr[c + 0x40] = name_utf16.len() as u8;
+            attr[c + 0x41] = 1; // Win32 namespace
+            for (i, w) in name_utf16.iter().enumerate() {
+                attr[c + 0x42 + i * 2..c + 0x44 + i * 2].copy_from_slice(&le16(*w));
+            }
+            attr
+        }
+
+        #[test]
+        fn filename_parses_name_and_parent() {
+            let attr = fake_filename_attr("hello.txt", 5);
+            let (name, parent) = parse_filename(&attr).expect("must parse");
+            assert_eq!(name, "hello.txt");
+            assert_eq!(parent, 5);
+        }
+
+        #[test]
+        fn filename_parses_long_name() {
+            let long = "this_is_a_much_longer_filename_12345.docx";
+            let attr = fake_filename_attr(long, 123456);
+            let (name, parent) = parse_filename(&attr).expect("must parse");
+            assert_eq!(name, long);
+            assert_eq!(parent, 123456);
+        }
     }
 }
 
