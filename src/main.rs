@@ -880,8 +880,8 @@ impl App {
     }
 
     /// Startup dialog: pick a drive to scan. Drives with <10% free space
-    /// are flagged red. Clicking a drive selects it and closes the dialog;
-    /// the Scan button selects and starts scanning immediately.
+    /// are flagged red. Clicking a drive selects it, closes the dialog and
+    /// starts scanning immediately; Cancel closes without scanning.
     fn draw_drive_picker(&mut self, ctx: &egui::Context) {
         let mut open = self.show_drive_picker;
         let mut picked: Option<String> = None;
@@ -950,6 +950,7 @@ impl App {
             self.drive = d;
             self.refresh_disk_space();
             self.show_drive_picker = false;
+            self.start_scan();
         }
         if scan_now {
             self.refresh_disk_space();
