@@ -896,6 +896,51 @@ impl eframe::App for App {
     }
 }
 
+/// egui's built-in font has no CJK glyphs, so Chinese text (e.g. the context
+/// menu) renders as tofu boxes. Load a system CJK font at startup instead of
+/// bundling a ~16MB font with the binary.
+fn setup_cjk_font(ctx: &egui::Context) {
+    let mut candidates: Vec<String> = Vec::new();
+    #[cfg(target_os = "windows")]
+    {
+        let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        for name in ["msyh.ttc", "msyhbd.ttc", "simsun.ttc"] {
+            candidates.push(format!(r"{sysroot}\Fonts\{name}"));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        candidates.push("/System/Library/Fonts/PingFang.ttc".to_string());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        candidates.extend(
+            [
+                "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+                "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        );
+    }
+    for path in candidates {
+        if let Ok(data) = std::fs::read(&path) {
+            let mut fonts = egui::FontDefinitions::default();
+            // .ttc is a font collection; index 0 is the regular face.
+            fonts.font_data.insert(
+                "cjk".to_owned(),
+                std::sync::Arc::new(egui::FontData::from_owned(data)),
+            );
+            if let Some(list) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+                list.insert(0, "cjk".to_owned());
+            }
+            ctx.set_fonts(fonts);
+            return;
+        }
+    }
+}
+
 fn main() -> eframe::Result<()> {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1120.0, 720.0]),
@@ -912,6 +957,7 @@ fn main() -> eframe::Result<()> {
             visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(44, 49, 58);
             visuals.selection.bg_fill = egui::Color32::from_rgb(76, 141, 255);
             cc.egui_ctx.set_visuals(visuals);
+            setup_cjk_font(&cc.egui_ctx);
             Ok(Box::new(App::new()))
         }),
     )
