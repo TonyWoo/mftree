@@ -266,19 +266,31 @@ mod imp {
         is_dir: bool,
     }
 
-    fn parse_filename(attr: &[u8]) -> Option<(String, u64)> {
+    /// Returns (name, parent_record, filename namespace).
+    fn parse_filename(attr: &[u8]) -> Option<(String, u64, u8)> {
         // resident attribute: content offset is a u16 at header offset 0x14
         let coff = u16_at(attr, 0x14) as usize;
         let c = attr.get(coff..)?;
         let parent = u64_at(c, 0) & 0xFFFF_FFFF_FFFF;
         let nlen = *c.get(0x40)? as usize;
+        // namespace: 1 = Win32, 2 = DOS 8.3 short name, 3 = Win32 & DOS
+        let ns = *c.get(0x41)?;
         let nb = c.get(0x42..0x42 + nlen * 2)?;
         let name = String::from_utf16_lossy(
             &nb.chunks_exact(2)
                 .map(|w| u16::from_le_bytes([w[0], w[1]]))
                 .collect::<Vec<_>>(),
         );
-        Some((name, parent))
+        Some((name, parent, ns))
+    }
+
+    /// Lower rank = more preferred filename namespace.
+    fn ns_rank(ns: u8) -> u8 {
+        match ns {
+            3 | 1 => 0, // Win32 & DOS / Win32: long names
+            0 => 1,     // POSIX
+            _ => 2,     // DOS 8.3 short names and anything else
+        }
     }
 
     fn parse_record(rec: &[u8], bps: u32) -> Option<RawEntry> {
@@ -292,11 +304,20 @@ mod imp {
         }
         let is_dir = flags & 0x02 != 0;
         let mut name: Option<(String, u64)> = None;
+        let mut name_ns_rank = u8::MAX;
         let mut size: u64 = 0;
         for_each_attr(&rec, |atype, attr| {
             match atype {
-                0x30 if name.is_none() && attr[8] == 0 => {
-                    name = parse_filename(attr);
+                0x30 if attr.len() > 9 && attr[8] == 0 => {
+                    // A record may carry several $FILE_NAME attributes
+                    // (Win32 long name + DOS 8.3 short name); prefer the long one.
+                    if let Some((n, p, ns)) = parse_filename(attr) {
+                        let r = ns_rank(ns);
+                        if r < name_ns_rank {
+                            name = Some((n, p));
+                            name_ns_rank = r;
+                        }
+                    }
                 }
                 0x80 if attr.len() > 9 && attr[9] == 0 => {
                     // unnamed $DATA only (skip alternate data streams)
@@ -456,8 +477,8 @@ mod imp {
         }
 
         /// Build a minimal resident $FILE_NAME attribute for `name` with the
-        /// given parent MFT record number.
-        fn fake_filename_attr(name: &str, parent: u64) -> Vec<u8> {
+        /// given parent MFT record number and filename namespace.
+        fn fake_filename_attr(name: &str, parent: u64, ns: u8) -> Vec<u8> {
             let name_utf16: Vec<u16> = name.encode_utf16().collect();
             let content_off = 0x18usize;
             let content_len = 0x42 + name_utf16.len() * 2;
@@ -471,17 +492,38 @@ mod imp {
             let c = content_off;
             attr[c..c + 6].copy_from_slice(&parent.to_le_bytes()[..6]);
             attr[c + 0x40] = name_utf16.len() as u8;
-            attr[c + 0x41] = 1; // Win32 namespace
+            attr[c + 0x41] = ns; // filename namespace
             for (i, w) in name_utf16.iter().enumerate() {
                 attr[c + 0x42 + i * 2..c + 0x44 + i * 2].copy_from_slice(&le16(*w));
             }
             attr
         }
 
+        /// Build a minimal MFT record containing the given attributes.
+        fn fake_record(attrs: &[Vec<u8>]) -> Vec<u8> {
+            let bps = 512usize;
+            let mut rec = vec![0u8; bps];
+            rec[0..4].copy_from_slice(b"FILE");
+            rec[0x16..0x18].copy_from_slice(&le16(0x01)); // in use
+            rec[4..6].copy_from_slice(&le16(0x2A)); // fixup offset
+            rec[6..8].copy_from_slice(&le16(2)); // fixup count: 1 sector
+            rec[0x2A..0x2C].copy_from_slice(&le16(0x1234)); // USN
+            rec[0x2C..0x2E].copy_from_slice(&le16(0x5678)); // replacement
+            rec[bps - 2..bps].copy_from_slice(&le16(0x1234)); // sector end matches USN
+            rec[0x14..0x16].copy_from_slice(&le16(0x30)); // first attribute offset
+            let mut off = 0x30usize;
+            for a in attrs {
+                rec[off..off + a.len()].copy_from_slice(a);
+                off += a.len();
+            }
+            rec[off..off + 4].copy_from_slice(&le32(0xFFFF_FFFF)); // terminator
+            rec
+        }
+
         #[test]
         fn filename_parses_name_and_parent() {
-            let attr = fake_filename_attr("hello.txt", 5);
-            let (name, parent) = parse_filename(&attr).expect("must parse");
+            let attr = fake_filename_attr("hello.txt", 5, 1);
+            let (name, parent, _ns) = parse_filename(&attr).expect("must parse");
             assert_eq!(name, "hello.txt");
             assert_eq!(parent, 5);
         }
@@ -489,10 +531,21 @@ mod imp {
         #[test]
         fn filename_parses_long_name() {
             let long = "this_is_a_much_longer_filename_12345.docx";
-            let attr = fake_filename_attr(long, 123456);
-            let (name, parent) = parse_filename(&attr).expect("must parse");
+            let attr = fake_filename_attr(long, 123456, 1);
+            let (name, parent, _ns) = parse_filename(&attr).expect("must parse");
             assert_eq!(name, long);
             assert_eq!(parent, 123456);
+        }
+
+        #[test]
+        fn filename_prefers_win32_long_name_over_dos_short() {
+            // DOS 8.3 short name first, Win32 long name second: must pick the long one.
+            let dos = fake_filename_attr("ORchar~1", 5, 2);
+            let win32 = fake_filename_attr("OrchardCore", 5, 1);
+            let rec = fake_record(&[dos, win32]);
+            let e = parse_record(&rec, 512).expect("must parse");
+            assert_eq!(e.name, "OrchardCore");
+            assert_eq!(e.parent, 5);
         }
     }
 }
