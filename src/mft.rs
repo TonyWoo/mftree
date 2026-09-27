@@ -180,24 +180,31 @@ mod imp {
 
     /// Apply the Update Sequence Number fixup. Returns None on torn records.
     pub fn apply_fixup(rec: &[u8], bps: u32) -> Option<Vec<u8>> {
-        let usn_off = u16_at(rec, 4) as usize;
-        let usn_cnt = u16_at(rec, 6) as usize;
+        let mut out = rec.to_vec();
+        apply_fixup_in_place(&mut out, bps)?;
+        Some(out)
+    }
+
+    /// Validate the update sequence and apply it in place.
+    /// Returns the fixed buffer as a slice on success.
+    fn apply_fixup_in_place(buf: &mut Vec<u8>, bps: u32) -> Option<&[u8]> {
+        let usn_off = u16_at(buf, 4) as usize;
+        let usn_cnt = u16_at(buf, 6) as usize;
         let nsectors = usn_cnt.checked_sub(1)?;
-        if nsectors == 0 || rec.len() < nsectors * bps as usize {
+        if nsectors == 0 || buf.len() < nsectors * bps as usize {
             return None;
         }
-        let usn = u16_at(rec, usn_off);
-        let mut out = rec.to_vec();
+        let usn = u16_at(buf, usn_off);
         for i in 1..usn_cnt {
             let pos = i * bps as usize - 2;
-            if u16_at(&out, pos) != usn {
+            if u16_at(buf, pos) != usn {
                 return None;
             }
-            let repl = u16_at(rec, usn_off + 2 * i);
-            out[pos] = (repl & 0xFF) as u8;
-            out[pos + 1] = (repl >> 8) as u8;
+            let repl = u16_at(buf, usn_off + 2 * i);
+            buf[pos] = (repl & 0xFF) as u8;
+            buf[pos + 1] = (repl >> 8) as u8;
         }
-        Some(out)
+        Some(buf)
     }
 
     fn for_each_attr(rec: &[u8], mut f: impl FnMut(u32, &[u8])) {
@@ -303,11 +310,24 @@ mod imp {
     }
 
     pub fn parse_record(rec: &[u8], bps: u32) -> Option<RawEntry> {
+        let mut scratch = Vec::new();
+        parse_record_with_scratch(rec, bps, &mut scratch)
+    }
+
+    /// Same as [`parse_record`], but reuses `scratch` for the fixup copy so a
+    /// tight scan loop doesn't allocate once per MFT record.
+    pub fn parse_record_with_scratch(
+        rec: &[u8],
+        bps: u32,
+        scratch: &mut Vec<u8>,
+    ) -> Option<RawEntry> {
         if rec.len() < 48 || &rec[0..4] != b"FILE" {
             return None;
         }
-        let rec = apply_fixup(rec, bps)?;
-        let flags = u16_at(&rec, 0x16);
+        scratch.clear();
+        scratch.extend_from_slice(rec);
+        let rec = apply_fixup_in_place(scratch, bps)?;
+        let flags = u16_at(rec, 0x16);
         if flags & 0x01 == 0 {
             return None; // not in use
         }
@@ -387,11 +407,12 @@ mod imp {
 
         let nrec = mft.len() / rec_size;
         let mut raws: HashMap<u64, RawEntry> = HashMap::with_capacity(nrec / 2);
+        let mut scratch = Vec::with_capacity(rec_size);
         for (i, chunk) in mft.chunks_exact(rec_size).enumerate() {
             if i % 4096 == 0 && !progress(i as u64) {
                 return Err("cancelled".to_string());
             }
-            if let Some(e) = parse_record(chunk, bps) {
+            if let Some(e) = parse_record_with_scratch(chunk, bps, &mut scratch) {
                 raws.insert(i as u64, e);
             }
         }
@@ -571,12 +592,31 @@ mod imp {
                     let size = md.len();
                     let alloc = md.blocks() * 512;
                     files.push((p.clone(), size, alloc, modified));
-                    let mut anc = p.parent();
-                    while let Some(d) = anc {
-                        let e = dir_agg.entry(d.to_path_buf()).or_insert((0, 0));
-                        e.0 += size;
-                        e.1 += alloc;
-                        anc = d.parent();
+                    // aggregate into the immediate parent only (allocation-free:
+                    // every visited dir is already in dir_agg); subtree totals
+                    // are propagated bottom-up after the walk.
+                    if let Some(parent) = p.parent() {
+                        if let Some(e) = dir_agg.get_mut(parent) {
+                            e.0 += size;
+                            e.1 += alloc;
+                        } else {
+                            dir_agg.insert(parent.to_path_buf(), (size, alloc));
+                        }
+                    }
+                }
+            }
+        }
+        // Propagate directory totals bottom-up: deepest dirs first, so when a
+        // dir is processed all of its children have already been folded in.
+        let mut dirs: Vec<PathBuf> = dir_agg.keys().cloned().collect();
+        dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+        for d in &dirs {
+            if let Some(parent) = d.parent() {
+                let (s, a) = dir_agg[d];
+                if s != 0 || a != 0 {
+                    if let Some(e) = dir_agg.get_mut(parent) {
+                        e.0 += s;
+                        e.1 += a;
                     }
                 }
             }
