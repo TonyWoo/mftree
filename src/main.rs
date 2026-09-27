@@ -109,29 +109,35 @@ fn parent_dir(path: &str) -> &str {
     }
 }
 
-fn lerp(a: f64, b: f64, t: f64) -> f64 {
-    a + (b - a) * t
+/// Categorical treemap color: distinct hues per folder so neighbors are easy
+/// to tell apart. Size is already encoded by area, so color is not size-based.
+/// Golden-ratio hue rotation spreads sibling hues; deeper levels are slightly
+/// darker. Saturation/value stay moderate so white labels remain readable.
+fn folder_color(k: usize, depth: usize) -> egui::Color32 {
+    let hue = (k as f32 * 0.618034 + depth as f32 * 0.381966) % 1.0;
+    let v = 0.80 - depth.min(2) as f32 * 0.06;
+    hsv_to_rgb(hue, 0.52, v)
 }
 
-/// Heat color for a 0..1 size fraction: blue (small) -> yellow (mid) -> red (large).
-fn heat_color_t(t: f64) -> egui::Color32 {
-    let t = t.clamp(0.0, 1.0);
-    let (r, g, b) = if t < 0.5 {
-        let u = t / 0.5;
-        (
-            lerp(90.0, 235.0, u),
-            lerp(150.0, 200.0, u),
-            lerp(255.0, 90.0, u),
-        )
-    } else {
-        let u = (t - 0.5) / 0.5;
-        (
-            lerp(235.0, 225.0, u),
-            lerp(200.0, 85.0, u),
-            lerp(90.0, 80.0, u),
-        )
+/// Plain HSV (each 0..=1) to RGB.
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> egui::Color32 {
+    let h = ((h.fract() * 6.0) % 6.0 + 6.0) % 6.0;
+    let c = v * s;
+    let x = c * (1.0 - (h % 2.0 - 1.0).abs());
+    let m = v - c;
+    let (r, g, b) = match h as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
     };
-    egui::Color32::from_rgb(r as u8, g as u8, b as u8)
+    egui::Color32::from_rgb(
+        ((r + m) * 255.0).round() as u8,
+        ((g + m) * 255.0).round() as u8,
+        ((b + m) * 255.0).round() as u8,
+    )
 }
 
 /// Truncate `name` with a trailing '…' so its rendered width fits `max_w`,
@@ -169,16 +175,6 @@ fn fit_label(painter: &egui::Painter, name: &str, font: &egui::FontId, max_w: f3
     } else {
         chars[..lo].iter().collect::<String>() + "…"
     }
-}
-
-/// Heat color by size on a log scale between `cmin`/`cmax` (ln of sizes).
-fn heat_color(size: f64, cmin: f64, cmax: f64) -> egui::Color32 {
-    let t = if cmax > cmin {
-        (size.max(1.0).ln() - cmin) / (cmax - cmin)
-    } else {
-        0.5
-    };
-    heat_color_t(t)
 }
 
 #[cfg(windows)]
@@ -904,7 +900,7 @@ impl App {
                             let (total, free) = mft::disk_space(&drive).unwrap_or((0, 0));
                             let low = total > 0 && (free as f64) / (total as f64) < LOW_FREE_FRAC;
                             let name = if low {
-                                egui::RichText::new(format!("⚠ {drive}"))
+                                egui::RichText::new(format!("{drive} ⚠"))
                                     .color(egui::Color32::from_rgb(235, 110, 110))
                                     .strong()
                             } else {
@@ -1093,36 +1089,9 @@ impl App {
             }
         }
 
-        // legend: size gradient
+        // how many folders are shown in the treemap
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(tr(self.lang, S::LegendSmall))
-                    .small()
-                    .weak(),
-            );
-            let (rrect, _) = ui.allocate_exact_size(egui::vec2(120.0, 10.0), egui::Sense::hover());
-            {
-                let p = ui.painter();
-                let steps = 24;
-                for i in 0..steps {
-                    let c = heat_color_t(i as f64 / (steps - 1) as f64);
-                    let x0 = rrect.min.x + rrect.width() * i as f32 / steps as f32;
-                    p.rect_filled(
-                        egui::Rect::from_min_size(
-                            egui::pos2(x0, rrect.min.y),
-                            egui::vec2(rrect.width() / steps as f32 + 1.0, rrect.height()),
-                        ),
-                        0.0,
-                        c,
-                    );
-                }
-            }
-            ui.label(
-                egui::RichText::new(tr(self.lang, S::LegendLarge))
-                    .small()
-                    .weak(),
-            );
             ui.label(
                 egui::RichText::new(i18n::top_n(self.lang, top.len()))
                     .small()
@@ -1152,20 +1121,6 @@ impl App {
         if indices.is_empty() || w < 4.0 || h < 4.0 {
             return;
         }
-        // Per-level color scale: largest sibling -> red, smallest -> blue.
-        let max_s = indices
-            .iter()
-            .map(|&i| self.dirs[i].size)
-            .max()
-            .unwrap_or(1)
-            .max(1) as f64;
-        let min_s = indices
-            .iter()
-            .map(|&i| self.dirs[i].size)
-            .min()
-            .unwrap_or(1)
-            .max(1) as f64;
-        let (cmin, cmax) = (min_s.ln(), max_s.ln());
         let weights: Vec<f64> = indices.iter().map(|&i| self.dirs[i].size as f64).collect();
         let rects = treemap::squarify(&weights, x, y, w, h);
         let font_big = egui::FontId::proportional(12.0);
@@ -1184,7 +1139,7 @@ impl App {
                 egui::pos2(origin.x + r.x as f32 + 1.0, origin.y + r.y as f32 + 1.0),
                 egui::vec2(r.w as f32 - 2.0, r.h as f32 - 2.0),
             );
-            let col = heat_color(size as f64, cmin, cmax);
+            let col = folder_color(k, depth);
             let id = ui.id().with(("tm", depth, idx));
             let rr = ui.interact(er, id, egui::Sense::click());
             let hot = rr.hovered() || self.selected == Some((ListTab::Folders, idx));

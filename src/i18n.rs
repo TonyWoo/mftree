@@ -56,8 +56,6 @@ pub enum S {
     FolderWord,
     FileWord,
     TopN,
-    LegendSmall,
-    LegendLarge,
     PickerTitle,
     PickerHint,
     StatusPickDrive,
@@ -155,14 +153,6 @@ pub fn tr(lang: Lang, id: S) -> &'static str {
         S::TopN => match lang {
             Lang::Zh => "按大小排列的前 {n} 个文件夹",
             Lang::En => "Top {n} folders by size",
-        },
-        S::LegendSmall => match lang {
-            Lang::Zh => "小",
-            Lang::En => "small",
-        },
-        S::LegendLarge => match lang {
-            Lang::Zh => "大",
-            Lang::En => "large",
         },
         S::PickerTitle => match lang {
             Lang::Zh => "选择要扫描的盘",
