@@ -13,7 +13,6 @@ mod mft;
 mod treemap;
 
 use eframe::egui;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Instant;
@@ -64,31 +63,14 @@ fn short_name(path: &str) -> &str {
     path.rsplit(['\\', '/']).next().unwrap_or(path)
 }
 
-/// Category label + stable color for a path, used by the treemap and legend.
-fn category_of(path: &str) -> (&'static str, egui::Color32) {
-    let ext = short_name(path)
-        .rsplit('.')
-        .next()
-        .unwrap_or("")
-        .to_lowercase();
-    match ext.as_str() {
-        "mp4" | "mkv" | "avi" | "mov" | "wmv" | "flv" | "webm" => {
-            ("video", egui::Color32::from_rgb(226, 90, 90))
-        }
-        "mp3" | "flac" | "wav" | "aac" | "ogg" | "m4a" => {
-            ("audio", egui::Color32::from_rgb(230, 150, 60))
-        }
-        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "tiff" | "heic" => {
-            ("images", egui::Color32::from_rgb(90, 178, 90))
-        }
-        "zip" | "rar" | "7z" | "tar" | "gz" | "iso" => {
-            ("archives", egui::Color32::from_rgb(214, 188, 70))
-        }
-        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "md" => {
-            ("docs", egui::Color32::from_rgb(90, 140, 228))
-        }
-        "exe" | "dll" | "msi" | "sys" => ("exe/sys", egui::Color32::from_rgb(158, 110, 218)),
-        _ => ("other", egui::Color32::from_rgb(148, 148, 148)),
+/// Parent directory of a path, e.g. `parent_dir("C:\\Windows\\Sys") == "C:\\Windows"`.
+fn parent_dir(path: &str) -> &str {
+    let name = short_name(path);
+    let p = path[..path.len() - name.len()].trim_end_matches(['\\', '/']);
+    if p.is_empty() {
+        "/"
+    } else {
+        p
     }
 }
 
@@ -223,6 +205,11 @@ struct App {
     rows_total: usize,
     rows_key: Option<RowsKey>,
     data_version: u64,
+    /// Cached treemap folder indices into `dirs` (direct children of the
+    /// current view root, size-desc, capped); recomputed only when the view
+    /// root or data changes.
+    tm_folders: Vec<usize>,
+    tm_key: Option<(Option<String>, u64)>,
 }
 
 impl App {
@@ -257,6 +244,8 @@ impl App {
             rows_total: 0,
             rows_key: None,
             data_version: 0,
+            tm_folders: Vec::new(),
+            tm_key: None,
         };
         app.refresh_disk_space();
         app
@@ -708,27 +697,52 @@ impl App {
         self.sort_asc = asc;
     }
 
+    /// Treemap of folders: direct child folders of the current view root,
+    /// sized by total folder size. Click a folder to drill into it.
     fn draw_treemap(&mut self, ui: &mut egui::Ui) {
-        if self.files.is_empty() {
+        if self.dirs.is_empty() {
             ui.centered_and_justified(|ui| {
                 ui.label("No data yet — hit Scan.");
             });
             return;
         }
-        let top: Vec<usize> = (0..self.files.len().min(400)).collect();
-        let weights: Vec<f64> = top.iter().map(|&i| self.files[i].size as f64).collect();
+        // Current view root as a plain path ("C:" at drive root).
+        let drive_root = {
+            let d = self.drive.trim_end_matches(':');
+            if d == "/" || d.is_empty() {
+                "/".to_string()
+            } else {
+                format!("{d}:")
+            }
+        };
+        let root = self.view_root.clone().unwrap_or(drive_root);
 
-        // legend data: total size per category over the top-400
-        let mut cat_map: HashMap<&'static str, (u64, egui::Color32)> = HashMap::new();
-        for &i in &top {
-            let (name, col) = category_of(&self.files[i].path);
-            let e = cat_map.entry(name).or_insert((0, col));
-            e.0 += self.files[i].size;
+        // Direct child folders of the root, size-desc, capped at 200.
+        // dirs is size-desc from the scan, so filter-in-order is enough.
+        let key = (Some(root.clone()), self.data_version);
+        if self.tm_key.as_ref() != Some(&key) {
+            let mut top: Vec<usize> = Vec::new();
+            for (i, d) in self.dirs.iter().enumerate() {
+                if parent_dir(&d.path) == root.as_str() {
+                    top.push(i);
+                    if top.len() >= 200 {
+                        break;
+                    }
+                }
+            }
+            self.tm_folders = top;
+            self.tm_key = Some(key);
         }
-        let mut cats: Vec<(&'static str, egui::Color32, u64)> =
-            cat_map.into_iter().map(|(n, (s, c))| (n, c, s)).collect();
-        cats.sort_by_key(|(_, _, s)| std::cmp::Reverse(*s));
-        cats.truncate(8);
+        if self.tm_folders.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label("No subfolders here.");
+            });
+            return;
+        }
+        // Copy indices out so the borrow on self ends before drawing.
+        let top: Vec<usize> = self.tm_folders.clone();
+        let max_size = self.dirs[top[0]].size.max(1) as f64;
+        let weights: Vec<f64> = top.iter().map(|&i| self.dirs[i].size as f64).collect();
 
         let avail = ui.available_size();
         let tm_h = (avail.y - 34.0).max(60.0);
@@ -737,6 +751,8 @@ impl App {
         let rects = treemap::squarify(&weights, 0.0, 0.0, avail.x as f64, tm_h as f64);
         let font_big = egui::FontId::proportional(12.0);
         let font_small = egui::FontId::proportional(11.0);
+        // Blue scale: larger folders are brighter.
+        let base = egui::Color32::from_rgb(88, 150, 255);
         for (k, r) in rects.iter().enumerate() {
             if r.w < 2.0 || r.h < 2.0 {
                 continue;
@@ -746,16 +762,17 @@ impl App {
                 egui::vec2(r.w as f32 - 2.0, r.h as f32 - 2.0),
             );
             let idx = top[k];
-            let it = &self.files[idx];
-            let (_, base) = category_of(&it.path);
+            let it = &self.dirs[idx];
+            let t = (it.size as f64 / max_size).powf(0.35) as f32;
+            let col = base.gamma_multiply(0.45 + 0.55 * t);
             let id = ui.id().with(("tm", idx));
             let rr = ui.interact(er, id, egui::Sense::click());
-            let hot = rr.hovered() || self.selected == Some((ListTab::Files, idx));
-            painter.rect_filled(er, 3.0, if hot { base } else { base.gamma_multiply(0.82) });
+            let hot = rr.hovered() || self.selected == Some((ListTab::Folders, idx));
+            painter.rect_filled(er, 3.0, if hot { base } else { col });
             if rr.clicked() {
-                self.selected = Some((ListTab::Files, idx));
-                self.list_tab = ListTab::Files;
-                self.scroll_to_sel = true;
+                // Drill into the folder, like double-clicking it in the list.
+                self.view_root = Some(it.path.clone());
+                self.selected = None;
             }
             rr.on_hover_text(format!("{}\n{}", it.path, human(it.size)));
             // in-rectangle labels
@@ -796,12 +813,11 @@ impl App {
 
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Legend:").small().weak());
-            for (name, col, _) in &cats {
-                let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                ui.painter().circle_filled(r.center(), 5.0, *col);
-                ui.label(egui::RichText::new(*name).small());
-            }
+            ui.label(
+                egui::RichText::new(format!("Top {} folders by size", top.len()))
+                    .small()
+                    .weak(),
+            );
         });
     }
 }
