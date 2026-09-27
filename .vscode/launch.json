@@ -1,0 +1,30 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            // Windows 原生调试器（随 C/C++ 扩展自带，无需另装）
+            "name": "mftree (Windows)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/debug/mftree.exe",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "cargo build (debug)"
+        },
+        {
+            // 需要安装 CodeLLDB 扩展 (vadimcn.vscode-lldb)，跨平台通用
+            "name": "mftree (CodeLLDB)",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": ["build", "--bin", "mftree"],
+                "filter": {
+                    "name": "mftree",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}

@@ -1,0 +1,22 @@
+[package]
+name = "sizetree"
+version = "0.2.0"
+edition = "2021"
+description = "WizTree-style disk usage analyzer in Rust — reads the NTFS MFT directly"
+license = "MIT"
+repository = "https://github.com/TonyWoo/sizetree"
+
+[dependencies]
+chrono = "0.4"
+eframe = "0.36"
+egui_extras = "0.36"
+trash = "5"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+
+[profile.release]
+opt-level = 3
