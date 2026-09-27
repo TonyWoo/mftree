@@ -9,12 +9,12 @@
     windows_subsystem = "windows"
 )]
 
-mod i18n;
-mod mft;
-mod treemap;
-
 use eframe::egui;
-use i18n::{tr, Lang, S};
+use sizetree::{
+    i18n::{self, tr, Lang, S},
+    mft, treemap,
+    util::{breadcrumb_segs, folder_color, human, parent_dir, path_under, short_name},
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -83,63 +83,6 @@ fn usage_bar(ui: &mut egui::Ui, total: u64, free: u64, width: f32) {
     }
 }
 
-fn human(n: u64) -> String {
-    let mut v = n as f64;
-    for u in ["B", "KB", "MB", "GB", "TB"] {
-        if v < 1024.0 || u == "TB" {
-            return format!("{v:7.1} {u}");
-        }
-        v /= 1024.0;
-    }
-    unreachable!()
-}
-
-fn short_name(path: &str) -> &str {
-    path.rsplit(['\\', '/']).next().unwrap_or(path)
-}
-
-/// Parent directory of a path, e.g. `parent_dir("C:\\Windows\\Sys") == "C:\\Windows"`.
-fn parent_dir(path: &str) -> &str {
-    let name = short_name(path);
-    let p = path[..path.len() - name.len()].trim_end_matches(['\\', '/']);
-    if p.is_empty() {
-        "/"
-    } else {
-        p
-    }
-}
-
-/// Categorical treemap color: distinct hues per folder so neighbors are easy
-/// to tell apart. Size is already encoded by area, so color is not size-based.
-/// Golden-ratio hue rotation spreads sibling hues; deeper levels are slightly
-/// darker. Saturation/value stay moderate so white labels remain readable.
-fn folder_color(k: usize, depth: usize) -> egui::Color32 {
-    let hue = (k as f32 * 0.618034 + depth as f32 * 0.381966) % 1.0;
-    let v = 0.80 - depth.min(2) as f32 * 0.06;
-    hsv_to_rgb(hue, 0.52, v)
-}
-
-/// Plain HSV (each 0..=1) to RGB.
-fn hsv_to_rgb(h: f32, s: f32, v: f32) -> egui::Color32 {
-    let h = ((h.fract() * 6.0) % 6.0 + 6.0) % 6.0;
-    let c = v * s;
-    let x = c * (1.0 - (h % 2.0 - 1.0).abs());
-    let m = v - c;
-    let (r, g, b) = match h as u32 {
-        0 => (c, x, 0.0),
-        1 => (x, c, 0.0),
-        2 => (0.0, c, x),
-        3 => (0.0, x, c),
-        4 => (x, 0.0, c),
-        _ => (c, 0.0, x),
-    };
-    egui::Color32::from_rgb(
-        ((r + m) * 255.0).round() as u8,
-        ((g + m) * 255.0).round() as u8,
-        ((b + m) * 255.0).round() as u8,
-    )
-}
-
 /// Truncate `name` with a trailing '…' so its rendered width fits `max_w`,
 /// keeping as many characters as possible. Width is measured with the real
 /// font, so wide glyphs (e.g. CJK) truncate correctly too.
@@ -175,36 +118,6 @@ fn fit_label(painter: &egui::Painter, name: &str, font: &egui::FontId, max_w: f3
     } else {
         chars[..lo].iter().collect::<String>() + "…"
     }
-}
-
-#[cfg(windows)]
-const MAIN_SEP: char = '\\';
-#[cfg(not(windows))]
-const MAIN_SEP: char = '/';
-
-/// True if `path` is strictly inside directory `dir`.
-fn path_under(path: &str, dir: &str) -> bool {
-    path.len() > dir.len()
-        && path.starts_with(dir)
-        && matches!(path.as_bytes().get(dir.len()), Some(b'\\') | Some(b'/'))
-}
-
-/// Split a directory path into breadcrumb segments: (display, full_path).
-fn breadcrumb_segs(root: &str) -> Vec<(String, String)> {
-    let parts: Vec<&str> = root.split(['\\', '/']).filter(|s| !s.is_empty()).collect();
-    let mut out = Vec::new();
-    let mut acc = String::new();
-    for p in parts {
-        if acc.is_empty() && root.starts_with('/') {
-            acc.push('/');
-        }
-        if !acc.is_empty() && !acc.ends_with(['\\', '/']) {
-            acc.push(MAIN_SEP);
-        }
-        acc.push_str(p);
-        out.push((p.to_string(), acc.clone()));
-    }
-    out
 }
 
 /// Reveal a path in the system file manager.
@@ -1527,115 +1440,4 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(App::new()))
         }),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn path_under_windows() {
-        assert!(path_under("C:\\Users\\Tony\\a.txt", "C:\\Users\\Tony"));
-        assert!(!path_under("C:\\Users\\Tony2\\a.txt", "C:\\Users\\Tony"));
-        assert!(!path_under("C:\\Users\\Tony", "C:\\Users\\Tony"));
-    }
-
-    #[test]
-    fn path_under_unix() {
-        assert!(path_under("/a/b/c", "/a/b"));
-        assert!(!path_under("/ab/c", "/a"));
-    }
-
-    #[test]
-    fn breadcrumbs() {
-        let segs = breadcrumb_segs("C:\\Users\\Tony");
-        assert_eq!(segs.len(), 3);
-        assert_eq!(segs[0], ("C:".to_string(), "C:".to_string()));
-        assert_eq!(segs[2].1, format!("C:{s}Users{s}Tony", s = MAIN_SEP));
-
-        let segs = breadcrumb_segs("/a/b");
-        assert_eq!(segs.len(), 2);
-        assert!(segs[0].1.ends_with("a"));
-    }
-
-    #[test]
-    fn breadcrumbs_edge_cases() {
-        assert!(breadcrumb_segs("/").is_empty());
-        assert!(breadcrumb_segs("").is_empty());
-        let segs = breadcrumb_segs("C:\\");
-        assert_eq!(segs.len(), 1);
-        assert_eq!(segs[0].0, "C:");
-    }
-
-    #[test]
-    fn human_sizes() {
-        assert_eq!(human(0), "    0.0 B");
-        assert_eq!(human(512), "  512.0 B");
-        assert_eq!(human(1023), " 1023.0 B");
-        assert_eq!(human(1024), "    1.0 KB");
-        assert_eq!(human(1536), "    1.5 KB");
-        assert_eq!(human(1024 * 1024), "    1.0 MB");
-        assert_eq!(human(5 * 1024 * 1024 * 1024), "    5.0 GB");
-        assert_eq!(human(2 * 1024 * 1024 * 1024 * 1024), "    2.0 TB");
-        assert!(human(u64::MAX).ends_with("TB"));
-    }
-
-    #[test]
-    fn short_name_cases() {
-        assert_eq!(short_name("C:\\a\\b"), "b");
-        assert_eq!(short_name("C:\\a\\"), "");
-        assert_eq!(short_name("/a/b"), "b");
-        assert_eq!(short_name("C:"), "C:");
-        assert_eq!(short_name("file.txt"), "file.txt");
-    }
-
-    #[test]
-    fn parent_dir_cases() {
-        assert_eq!(parent_dir("C:\\Windows\\Sys"), "C:\\Windows");
-        assert_eq!(parent_dir("C:\\Windows"), "C:");
-        assert_eq!(parent_dir("/a/b"), "/a");
-        assert_eq!(parent_dir("/"), "/");
-    }
-
-    #[test]
-    fn hsv_known_colors() {
-        assert_eq!(
-            hsv_to_rgb(0.0, 1.0, 1.0),
-            egui::Color32::from_rgb(255, 0, 0)
-        );
-        assert_eq!(
-            hsv_to_rgb(1.0 / 3.0, 1.0, 1.0),
-            egui::Color32::from_rgb(0, 255, 0)
-        );
-        assert_eq!(
-            hsv_to_rgb(2.0 / 3.0, 1.0, 1.0),
-            egui::Color32::from_rgb(0, 0, 255)
-        );
-        assert_eq!(
-            hsv_to_rgb(0.5, 1.0, 1.0),
-            egui::Color32::from_rgb(0, 255, 255)
-        );
-        assert_eq!(hsv_to_rgb(0.0, 0.0, 1.0), egui::Color32::WHITE);
-        assert_eq!(hsv_to_rgb(0.0, 0.0, 0.0), egui::Color32::BLACK);
-    }
-
-    #[test]
-    fn folder_color_distinct_and_stable() {
-        // deterministic
-        assert_eq!(folder_color(3, 0), folder_color(3, 0));
-        // opaque so labels stay readable
-        for k in 0..16 {
-            assert_eq!(folder_color(k, 0).a(), 255);
-        }
-        // siblings get pairwise distinct colors
-        let cols: Vec<_> = (0..12).map(|k| folder_color(k, 0)).collect();
-        for (i, a) in cols.iter().enumerate() {
-            for b in &cols[i + 1..] {
-                assert_ne!(a, b, "duplicate color at sibling {i}");
-            }
-        }
-        // depth shifts the palette
-        assert_ne!(folder_color(0, 0), folder_color(0, 1));
-        assert_ne!(folder_color(0, 1), folder_color(0, 2));
-    }
 }

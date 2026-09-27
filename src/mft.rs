@@ -141,7 +141,7 @@ mod imp {
         }
     }
 
-    fn u16_at(b: &[u8], off: usize) -> u16 {
+    pub fn u16_at(b: &[u8], off: usize) -> u16 {
         u16::from_le_bytes([b[off], b[off + 1]])
     }
     fn u32_at(b: &[u8], off: usize) -> u32 {
@@ -160,7 +160,7 @@ mod imp {
         ])
     }
 
-    fn parse_bootsector(bs: &[u8]) -> Result<(u32, u8, i64, usize), String> {
+    pub fn parse_bootsector(bs: &[u8]) -> Result<(u32, u8, i64, usize), String> {
         if bs.len() < 512 || &bs[3..7] != b"NTFS" {
             return Err("not an NTFS volume".into());
         }
@@ -177,7 +177,7 @@ mod imp {
     }
 
     /// Apply the Update Sequence Number fixup. Returns None on torn records.
-    fn apply_fixup(rec: &[u8], bps: u32) -> Option<Vec<u8>> {
+    pub fn apply_fixup(rec: &[u8], bps: u32) -> Option<Vec<u8>> {
         let usn_off = u16_at(rec, 4) as usize;
         let usn_cnt = u16_at(rec, 6) as usize;
         let nsectors = usn_cnt.checked_sub(1)?;
@@ -212,7 +212,7 @@ mod imp {
     }
 
     /// Parse an NTFS run list into (delta_lcn, length_in_clusters).
-    fn parse_runs(mut data: &[u8]) -> Vec<(i64, u64)> {
+    pub fn parse_runs(mut data: &[u8]) -> Vec<(i64, u64)> {
         let mut runs = Vec::new();
         while !data.is_empty() && data[0] != 0 {
             let b = data[0];
@@ -259,11 +259,11 @@ mod imp {
         result.ok_or_else(|| "no $DATA run list in MFT record 0".into())
     }
 
-    struct RawEntry {
-        name: String,
-        parent: u64,
-        size: u64,
-        is_dir: bool,
+    pub struct RawEntry {
+        pub name: String,
+        pub parent: u64,
+        pub size: u64,
+        pub is_dir: bool,
     }
 
     /// Returns (name, parent_record, filename namespace).
@@ -285,7 +285,7 @@ mod imp {
     }
 
     /// Lower rank = more preferred filename namespace.
-    fn ns_rank(ns: u8) -> u8 {
+    pub fn ns_rank(ns: u8) -> u8 {
         match ns {
             3 | 1 => 0, // Win32 & DOS / Win32: long names
             0 => 1,     // POSIX
@@ -293,7 +293,7 @@ mod imp {
         }
     }
 
-    fn parse_record(rec: &[u8], bps: u32) -> Option<RawEntry> {
+    pub fn parse_record(rec: &[u8], bps: u32) -> Option<RawEntry> {
         if rec.len() < 48 || &rec[0..4] != b"FILE" {
             return None;
         }
@@ -464,179 +464,6 @@ mod imp {
         }
         Ok(out)
     }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        fn le16(v: u16) -> [u8; 2] {
-            v.to_le_bytes()
-        }
-        fn le32(v: u32) -> [u8; 4] {
-            v.to_le_bytes()
-        }
-
-        /// Build a minimal resident $FILE_NAME attribute for `name` with the
-        /// given parent MFT record number and filename namespace.
-        fn fake_filename_attr(name: &str, parent: u64, ns: u8) -> Vec<u8> {
-            let name_utf16: Vec<u16> = name.encode_utf16().collect();
-            let content_off = 0x18usize;
-            let content_len = 0x42 + name_utf16.len() * 2;
-            let total_len = (content_off + content_len) as u32;
-            let mut attr = vec![0u8; content_off + content_len];
-            attr[0..4].copy_from_slice(&le32(0x30)); // type = $FILE_NAME
-            attr[4..8].copy_from_slice(&le32(total_len));
-            attr[8] = 0; // resident
-            attr[0x10..0x14].copy_from_slice(&le32(content_len as u32));
-            attr[0x14..0x16].copy_from_slice(&le16(content_off as u16));
-            let c = content_off;
-            attr[c..c + 6].copy_from_slice(&parent.to_le_bytes()[..6]);
-            attr[c + 0x40] = name_utf16.len() as u8;
-            attr[c + 0x41] = ns; // filename namespace
-            for (i, w) in name_utf16.iter().enumerate() {
-                attr[c + 0x42 + i * 2..c + 0x44 + i * 2].copy_from_slice(&le16(*w));
-            }
-            attr
-        }
-
-        /// Build a minimal MFT record containing the given attributes.
-        fn fake_record(attrs: &[Vec<u8>]) -> Vec<u8> {
-            let bps = 512usize;
-            let mut rec = vec![0u8; bps];
-            rec[0..4].copy_from_slice(b"FILE");
-            rec[0x16..0x18].copy_from_slice(&le16(0x01)); // in use
-            rec[4..6].copy_from_slice(&le16(0x2A)); // fixup offset
-            rec[6..8].copy_from_slice(&le16(2)); // fixup count: 1 sector
-            rec[0x2A..0x2C].copy_from_slice(&le16(0x1234)); // USN
-            rec[0x2C..0x2E].copy_from_slice(&le16(0x5678)); // replacement
-            rec[bps - 2..bps].copy_from_slice(&le16(0x1234)); // sector end matches USN
-            rec[0x14..0x16].copy_from_slice(&le16(0x30)); // first attribute offset
-            let mut off = 0x30usize;
-            for a in attrs {
-                rec[off..off + a.len()].copy_from_slice(a);
-                off += a.len();
-            }
-            rec[off..off + 4].copy_from_slice(&le32(0xFFFF_FFFF)); // terminator
-            rec
-        }
-
-        #[test]
-        fn filename_parses_name_and_parent() {
-            let attr = fake_filename_attr("hello.txt", 5, 1);
-            let (name, parent, _ns) = parse_filename(&attr).expect("must parse");
-            assert_eq!(name, "hello.txt");
-            assert_eq!(parent, 5);
-        }
-
-        #[test]
-        fn filename_parses_long_name() {
-            let long = "this_is_a_much_longer_filename_12345.docx";
-            let attr = fake_filename_attr(long, 123456, 1);
-            let (name, parent, _ns) = parse_filename(&attr).expect("must parse");
-            assert_eq!(name, long);
-            assert_eq!(parent, 123456);
-        }
-
-        #[test]
-        fn filename_prefers_win32_long_name_over_dos_short() {
-            // DOS 8.3 short name first, Win32 long name second: must pick the long one.
-            let dos = fake_filename_attr("ORchar~1", 5, 2);
-            let win32 = fake_filename_attr("OrchardCore", 5, 1);
-            let rec = fake_record(&[dos, win32]);
-            let e = parse_record(&rec, 512).expect("must parse");
-            assert_eq!(e.name, "OrchardCore");
-            assert_eq!(e.parent, 5);
-        }
-
-        #[test]
-        fn filename_falls_back_to_dos_short_name() {
-            // A DOS-only record keeps its short name rather than failing.
-            let dos = fake_filename_attr("ORchar~1", 5, 2);
-            let rec = fake_record(&[dos]);
-            let e = parse_record(&rec, 512).expect("must parse");
-            assert_eq!(e.name, "ORchar~1");
-        }
-
-        #[test]
-        fn ns_rank_orders_win32_above_dos() {
-            assert!(ns_rank(1) < ns_rank(2));
-            assert!(ns_rank(3) < ns_rank(2));
-            assert_eq!(ns_rank(1), ns_rank(3));
-            assert!(ns_rank(0) < ns_rank(2));
-        }
-
-        #[test]
-        fn record_rejects_bad_magic() {
-            let mut rec = fake_record(&[fake_filename_attr("a", 5, 1)]);
-            rec[0..4].copy_from_slice(b"BAAD");
-            assert!(parse_record(&rec, 512).is_none());
-        }
-
-        #[test]
-        fn record_rejects_not_in_use() {
-            let mut rec = fake_record(&[fake_filename_attr("a", 5, 1)]);
-            rec[0x16] = 0x00; // clear the in-use flag
-            rec[0x17] = 0x00;
-            assert!(parse_record(&rec, 512).is_none());
-        }
-
-        #[test]
-        fn fixup_applies_replacement() {
-            let rec = fake_record(&[fake_filename_attr("a", 5, 1)]);
-            let fixed = apply_fixup(&rec, 512).expect("must apply");
-            assert_eq!(u16_at(&fixed, 510), 0x5678);
-        }
-
-        #[test]
-        fn fixup_rejects_torn_record() {
-            let mut rec = fake_record(&[fake_filename_attr("a", 5, 1)]);
-            rec[510] = 0x00; // corrupt the sector-end update sequence
-            rec[511] = 0x00;
-            assert!(apply_fixup(&rec, 512).is_none());
-        }
-
-        /// Build a minimal NTFS boot sector: 512 B/sector, 8 sectors/cluster,
-        /// MFT at LCN 786432, 1024-byte MFT records.
-        fn fake_bootsector() -> Vec<u8> {
-            let mut bs = vec![0u8; 512];
-            bs[3..7].copy_from_slice(b"NTFS");
-            bs[0x0B..0x0D].copy_from_slice(&512u16.to_le_bytes());
-            bs[0x0D] = 8;
-            bs[0x30..0x38].copy_from_slice(&786432i64.to_le_bytes());
-            bs[0x40] = 0xF6; // clusters per MFT record = -10 -> 1024 bytes
-            bs
-        }
-
-        #[test]
-        fn bootsector_parses_fields() {
-            let (bps, spc, lcn, rec) = parse_bootsector(&fake_bootsector()).expect("must parse");
-            assert_eq!((bps, spc, lcn, rec), (512, 8, 786432, 1024));
-        }
-
-        #[test]
-        fn bootsector_rejects_non_ntfs() {
-            assert!(parse_bootsector(&vec![0u8; 512]).is_err());
-            assert!(parse_bootsector(&vec![0u8; 100]).is_err());
-        }
-
-        #[test]
-        fn runs_decode_single() {
-            // 0x11: 1 length byte, 1 offset byte; length 8, delta 5
-            assert_eq!(parse_runs(&[0x11, 0x08, 0x05]), vec![(5, 8)]);
-        }
-
-        #[test]
-        fn runs_decode_negative_delta() {
-            // delta 0xFF sign-extends to -1
-            assert_eq!(parse_runs(&[0x11, 0x04, 0xFF]), vec![(-1, 4)]);
-        }
-
-        #[test]
-        fn runs_decode_multiple_and_stop_at_terminator() {
-            let runs = parse_runs(&[0x11, 0x08, 0x05, 0x11, 0x04, 0xFF, 0x00]);
-            assert_eq!(runs, vec![(5, 8), (-1, 4)]);
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -722,4 +549,6 @@ mod imp {
     }
 }
 
+#[cfg(windows)]
+pub use imp::{apply_fixup, ns_rank, parse_bootsector, parse_record, parse_runs, u16_at, RawEntry};
 pub use imp::{disk_space, list_drives, scan};

@@ -6,6 +6,16 @@ On Windows it reads the NTFS `$MFT` directly (no slow directory walk — even a 
 
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
+## Screenshots
+
+![sizetree main window](screenshots/main.png)
+
+*Scanning `/` on Linux: sortable file list, recursive treemap, per-drive space bar.*
+
+![drive picker](screenshots/picker.png)
+
+*Drive picker at startup — picking a drive starts the scan immediately.*
+
 ## Features
 
 - **Fast scans** — direct `$MFT` parsing on Windows; parallel-friendly walker elsewhere
@@ -64,8 +74,23 @@ sibling folders rather than encoding size (area already does that).
 ```sh
 cargo fmt --all                                        # format
 cargo clippy --all-targets --locked -- -D warnings     # lint (strict)
-cargo test --locked                                    # unit tests
+cargo test --locked                                    # run all tests
+cargo test --locked --test treemap                     # run one test file
+cargo test --locked -- --nocapture                     # show test stdout
 ```
+
+Tests live in `tests/` (integration tests against the `sizetree` library):
+
+| file | what it covers | runs on |
+|---|---|---|
+| `tests/treemap.rs` | squarified layout: area conservation, proportionality, no overlap | all |
+| `tests/i18n.rs` | every string id localized Zh/En, formatter output | all |
+| `tests/util.rs` | size formatting, path helpers, breadcrumbs, colors | all |
+| `tests/mft.rs` | NTFS boot sector / run list / fixup / record parsing | Windows only |
+
+The Windows-only MFT code is cross-checked on Linux via
+`cargo check --target x86_64-pc-windows-gnu`; CI also runs the full
+suite on Windows.
 
 ## License
 
