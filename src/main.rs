@@ -134,6 +134,43 @@ fn heat_color_t(t: f64) -> egui::Color32 {
     egui::Color32::from_rgb(r as u8, g as u8, b as u8)
 }
 
+/// Truncate `name` with a trailing '…' so its rendered width fits `max_w`,
+/// keeping as many characters as possible. Width is measured with the real
+/// font, so wide glyphs (e.g. CJK) truncate correctly too.
+fn fit_label(painter: &egui::Painter, name: &str, font: &egui::FontId, max_w: f32) -> String {
+    if max_w < 10.0 {
+        return "…".to_string();
+    }
+    let full_w = painter
+        .layout_no_wrap(name.to_string(), font.clone(), egui::Color32::WHITE)
+        .size()
+        .x;
+    if full_w <= max_w {
+        return name.to_string();
+    }
+    let chars: Vec<char> = name.chars().collect();
+    let mut lo = 0usize;
+    let mut hi = chars.len();
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let s: String = chars[..mid].iter().collect::<String>() + "…";
+        let w = painter
+            .layout_no_wrap(s, font.clone(), egui::Color32::WHITE)
+            .size()
+            .x;
+        if w <= max_w {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    if lo == 0 {
+        "…".to_string()
+    } else {
+        chars[..lo].iter().collect::<String>() + "…"
+    }
+}
+
 /// Heat color by size on a log scale between `cmin`/`cmax` (ln of sizes).
 fn heat_color(size: f64, cmin: f64, cmax: f64) -> egui::Color32 {
     let t = if cmax > cmin {
@@ -1189,16 +1226,10 @@ impl App {
             }
             rr.on_hover_text(format!("{}\n{}", path, human(size)));
             // Labels for large-enough rects; nested children go below the label.
+            // Names are truncated by measured width so they show as completely
+            // as possible; the full path is always in the hover tooltip.
             let label_h = if r.w > 96.0 && r.h > 44.0 {
-                let name = short_name(&path);
-                let max_chars = ((r.w - 14.0) / 7.0) as usize;
-                let label: String = if max_chars >= 4 && name.chars().count() > max_chars {
-                    let mut s: String = name.chars().take(max_chars - 1).collect();
-                    s.push('…');
-                    s
-                } else {
-                    name.to_string()
-                };
+                let label = fit_label(painter, short_name(&path), &font_big, r.w as f32 - 14.0);
                 painter.text(
                     er.min + egui::vec2(6.0, 4.0),
                     egui::Align2::LEFT_TOP,
@@ -1215,15 +1246,7 @@ impl App {
                 );
                 36.0
             } else if r.w > 48.0 && r.h > 20.0 {
-                let name = short_name(&path);
-                let max_chars = ((r.w - 14.0) / 7.0) as usize;
-                let label: String = if max_chars >= 4 && name.chars().count() > max_chars {
-                    let mut s: String = name.chars().take(max_chars - 1).collect();
-                    s.push('…');
-                    s
-                } else {
-                    name.to_string()
-                };
+                let label = fit_label(painter, short_name(&path), &font_small, r.w as f32 - 14.0);
                 painter.text(
                     er.center(),
                     egui::Align2::CENTER_CENTER,
