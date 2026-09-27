@@ -927,10 +927,6 @@ impl App {
             });
             return;
         }
-        let max_s = self.dirs[top[0]].size as f64;
-        let min_s = self.dirs[*top.last().unwrap()].size as f64;
-        let (cmin, cmax) = (min_s.max(1.0).ln(), max_s.max(1.0).ln());
-
         let avail = ui.available_size();
         let tm_h = (avail.y - 34.0).max(60.0);
         let (resp, painter) = ui.allocate_painter(egui::vec2(avail.x, tm_h), egui::Sense::hover());
@@ -948,8 +944,6 @@ impl App {
             avail.x as f64,
             tm_h as f64,
             0,
-            cmin,
-            cmax,
             &mut menu_hit,
             &mut drill,
         );
@@ -998,6 +992,8 @@ impl App {
     }
 
     /// Draw one treemap level; recurses into subfolders for big-enough rects.
+    /// Colors are scaled per level, so siblings are always blue -> red by
+    /// their relative sizes within the current folder.
     #[allow(clippy::too_many_arguments)]
     fn draw_treemap_level(
         &mut self,
@@ -1010,14 +1006,26 @@ impl App {
         w: f64,
         h: f64,
         depth: usize,
-        cmin: f64,
-        cmax: f64,
         menu_hit: &mut Option<(MenuAction, String, u64, bool)>,
         drill: &mut Option<String>,
     ) {
         if indices.is_empty() || w < 4.0 || h < 4.0 {
             return;
         }
+        // Per-level color scale: largest sibling -> red, smallest -> blue.
+        let max_s = indices
+            .iter()
+            .map(|&i| self.dirs[i].size)
+            .max()
+            .unwrap_or(1)
+            .max(1) as f64;
+        let min_s = indices
+            .iter()
+            .map(|&i| self.dirs[i].size)
+            .min()
+            .unwrap_or(1)
+            .max(1) as f64;
+        let (cmin, cmax) = (min_s.ln(), max_s.ln());
         let weights: Vec<f64> = indices.iter().map(|&i| self.dirs[i].size as f64).collect();
         let rects = treemap::squarify(&weights, x, y, w, h);
         let font_big = egui::FontId::proportional(12.0);
@@ -1141,8 +1149,6 @@ impl App {
                         r.w - pad * 2.0,
                         r.h - pad * 2.0 - label_h,
                         depth + 1,
-                        cmin,
-                        cmax,
                         menu_hit,
                         drill,
                     );
