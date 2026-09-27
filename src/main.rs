@@ -3,6 +3,12 @@
 //! Reads the NTFS $MFT directly on Windows; falls back to a directory walk
 //! elsewhere. Shows the largest files/folders plus a treemap.
 
+// Hide the console window on Windows release builds (GUI-only app).
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 mod mft;
 mod treemap;
 
