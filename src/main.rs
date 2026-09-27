@@ -48,6 +48,38 @@ enum MenuAction {
     PermDelete,
 }
 
+/// Free-space fraction below which a drive is flagged red.
+const LOW_FREE_FRAC: f64 = 0.10;
+
+/// Small disk-usage bar. The used portion turns red when free space drops
+/// below [`LOW_FREE_FRAC`].
+fn usage_bar(ui: &mut egui::Ui, total: u64, free: u64, width: f32) {
+    let free_frac = if total > 0 {
+        free as f64 / total as f64
+    } else {
+        1.0
+    };
+    let used_frac = (1.0 - free_frac).clamp(0.0, 1.0);
+    let low = total > 0 && free_frac < LOW_FREE_FRAC;
+    let h = 12.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::hover());
+    let fill = if low {
+        egui::Color32::from_rgb(220, 70, 70)
+    } else {
+        egui::Color32::from_rgb(76, 141, 255)
+    };
+    let p = ui.painter();
+    p.rect_filled(rect, 3.0, egui::Color32::from_rgb(44, 49, 58));
+    let w = rect.width() * used_frac as f32;
+    if w >= 2.0 {
+        p.rect_filled(
+            egui::Rect::from_min_size(rect.min, egui::vec2(w, h)),
+            3.0,
+            fill,
+        );
+    }
+}
+
 fn human(n: u64) -> String {
     let mut v = n as f64;
     for u in ["B", "KB", "MB", "GB", "TB"] {
@@ -210,6 +242,9 @@ struct App {
     /// root or data changes.
     tm_folders: Vec<usize>,
     tm_key: Option<(Option<String>, u64)>,
+    /// Startup drive-picker dialog (shown once at launch).
+    show_drive_picker: bool,
+    picker_selected: String,
 }
 
 impl App {
@@ -219,6 +254,7 @@ impl App {
         let mut app = Self {
             drives,
             drive: drive.clone(),
+            picker_selected: drive.clone(),
             last_drive: drive,
             disk_total: 0,
             disk_free: 0,
@@ -246,6 +282,7 @@ impl App {
             data_version: 0,
             tm_folders: Vec::new(),
             tm_key: None,
+            show_drive_picker: true,
         };
         app.refresh_disk_space();
         app
@@ -697,6 +734,70 @@ impl App {
         self.sort_asc = asc;
     }
 
+    /// Startup dialog: pick a drive to scan. Drives with <10% free space
+    /// are flagged red.
+    fn draw_drive_picker(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_drive_picker;
+        egui::Window::new("Select drive to scan")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                ui.label("Choose a drive, then hit Scan.");
+                ui.add_space(6.0);
+                let mut picked: Option<String> = None;
+                for drive in self.drives.clone() {
+                    let (total, free) = mft::disk_space(&drive).unwrap_or((0, 0));
+                    let low = total > 0 && (free as f64) / (total as f64) < LOW_FREE_FRAC;
+                    let selected = self.picker_selected == drive;
+                    ui.horizontal(|ui| {
+                        let name = if low {
+                            egui::RichText::new(format!("⚠ {drive}"))
+                                .color(egui::Color32::from_rgb(235, 110, 110))
+                                .strong()
+                        } else {
+                            egui::RichText::new(&drive).strong()
+                        };
+                        if ui.selectable_label(selected, name).clicked() {
+                            picked = Some(drive.clone());
+                        }
+                        if total > 0 {
+                            usage_bar(ui, total, free, 120.0);
+                            let t = egui::RichText::new(format!(
+                                "{} free of {}",
+                                human(free).trim(),
+                                human(total).trim()
+                            ))
+                            .small();
+                            ui.label(if low {
+                                t.color(egui::Color32::from_rgb(235, 110, 110))
+                            } else {
+                                t.weak()
+                            });
+                        }
+                    });
+                }
+                if let Some(d) = picked {
+                    self.picker_selected = d;
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("🔍 Scan").clicked() {
+                        self.drive = self.picker_selected.clone();
+                        self.refresh_disk_space();
+                        self.show_drive_picker = false;
+                        self.start_scan();
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.show_drive_picker = false;
+                    }
+                });
+            });
+        self.show_drive_picker = open;
+    }
+
     /// Treemap of folders: direct child folders of the current view root,
     /// sized by total folder size. Click a folder to drill into it.
     fn draw_treemap(&mut self, ui: &mut egui::Ui) {
@@ -826,6 +927,10 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll(ui.ctx());
 
+        if self.show_drive_picker {
+            self.draw_drive_picker(ui.ctx());
+        }
+
         egui::Panel::top("top").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("mftree");
@@ -869,24 +974,24 @@ impl eframe::App for App {
                     }
                 });
             });
-            // disk space bar
+            // disk space bar (red when free space < 10%)
             if self.disk_total > 0 {
+                let (total, free) = (self.disk_total, self.disk_free);
+                let low = (free as f64) / (total.max(1) as f64) < LOW_FREE_FRAC;
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(&self.drive).small().weak());
-                    let used_frac = 1.0 - self.disk_free as f32 / self.disk_total.max(1) as f32;
-                    ui.add(
-                        egui::ProgressBar::new(used_frac.clamp(0.0, 1.0))
-                            .desired_width(ui.available_width() - 220.0),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{} free of {}",
-                            human(self.disk_free).trim(),
-                            human(self.disk_total).trim()
-                        ))
-                        .small()
-                        .weak(),
-                    );
+                    usage_bar(ui, total, free, ui.available_width() - 220.0);
+                    let txt = egui::RichText::new(format!(
+                        "{} free of {}",
+                        human(free).trim(),
+                        human(total).trim()
+                    ))
+                    .small();
+                    ui.label(if low {
+                        txt.color(egui::Color32::from_rgb(235, 110, 110)).strong()
+                    } else {
+                        txt.weak()
+                    });
                 });
             }
         });
