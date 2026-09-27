@@ -282,7 +282,6 @@ struct App {
     dir_index_version: u64,
     /// Startup drive-picker dialog (shown once at launch).
     show_drive_picker: bool,
-    picker_selected: String,
 }
 
 impl App {
@@ -292,7 +291,6 @@ impl App {
         let mut app = Self {
             drives,
             drive: drive.clone(),
-            picker_selected: drive.clone(),
             last_drive: drive,
             disk_total: 0,
             disk_free: 0,
@@ -793,8 +791,14 @@ impl App {
 
     /// Startup dialog: pick a drive to scan. Drives with <10% free space
     /// are flagged red.
+    /// Startup dialog: pick a drive to scan. Drives with <10% free space
+    /// are flagged red. Clicking a drive selects it and closes the dialog;
+    /// the Scan button selects and starts scanning immediately.
     fn draw_drive_picker(&mut self, ctx: &egui::Context) {
         let mut open = self.show_drive_picker;
+        let mut picked: Option<String> = None;
+        let mut scan_now = false;
+        let mut cancelled = false;
         egui::Window::new("Select drive to scan")
             .collapsible(false)
             .resizable(false)
@@ -802,61 +806,70 @@ impl App {
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.set_min_width(360.0);
-                ui.label("Choose a drive, then hit Scan.");
+                ui.label("Click a drive to select it.");
                 ui.add_space(6.0);
-                let mut picked: Option<String> = None;
-                for drive in self.drives.clone() {
-                    let (total, free) = mft::disk_space(&drive).unwrap_or((0, 0));
-                    let low = total > 0 && (free as f64) / (total as f64) < LOW_FREE_FRAC;
-                    let selected = self.picker_selected == drive;
-                    ui.horizontal(|ui| {
-                        let name = if low {
-                            egui::RichText::new(format!("⚠ {drive}"))
-                                .color(egui::Color32::from_rgb(235, 110, 110))
-                                .strong()
-                        } else {
-                            egui::RichText::new(&drive).strong()
-                        };
-                        if ui.selectable_label(selected, name).clicked() {
-                            picked = Some(drive.clone());
-                        }
-                        if total > 0 {
-                            usage_bar(ui, total, free, 120.0);
-                            let t = egui::RichText::new(format!(
-                                "{} free of {}",
-                                human(free).trim(),
-                                human(total).trim()
-                            ))
-                            .small();
-                            ui.label(if low {
-                                t.color(egui::Color32::from_rgb(235, 110, 110))
+                egui::Grid::new("drive_picker_grid")
+                    .num_columns(3)
+                    .spacing([12.0, 6.0])
+                    .show(ui, |ui| {
+                        for drive in self.drives.clone() {
+                            let (total, free) = mft::disk_space(&drive).unwrap_or((0, 0));
+                            let low = total > 0 && (free as f64) / (total as f64) < LOW_FREE_FRAC;
+                            let name = if low {
+                                egui::RichText::new(format!("⚠ {drive}"))
+                                    .color(egui::Color32::from_rgb(235, 110, 110))
+                                    .strong()
                             } else {
-                                t.weak()
-                            });
+                                egui::RichText::new(&drive).strong()
+                            };
+                            if ui.selectable_label(self.drive == drive, name).clicked() {
+                                picked = Some(drive.clone());
+                            }
+                            if total > 0 {
+                                usage_bar(ui, total, free, 120.0);
+                                let t = egui::RichText::new(format!(
+                                    "{} free of {}",
+                                    human(free).trim(),
+                                    human(total).trim()
+                                ))
+                                .small();
+                                ui.label(if low {
+                                    t.color(egui::Color32::from_rgb(235, 110, 110))
+                                } else {
+                                    t.weak()
+                                });
+                            } else {
+                                ui.label("");
+                                ui.label("");
+                            }
+                            ui.end_row();
                         }
                     });
-                }
-                if let Some(d) = picked {
-                    self.picker_selected = d;
-                }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("🔍 Scan").clicked() {
-                        self.drive = self.picker_selected.clone();
-                        self.refresh_disk_space();
-                        self.show_drive_picker = false;
-                        self.start_scan();
+                        scan_now = true;
                     }
                     if ui.button("Cancel").clicked() {
-                        self.show_drive_picker = false;
+                        cancelled = true;
                     }
                 });
             });
-        self.show_drive_picker = open;
+        if let Some(d) = picked {
+            self.drive = d;
+            self.refresh_disk_space();
+            self.show_drive_picker = false;
+        }
+        if scan_now {
+            self.refresh_disk_space();
+            self.show_drive_picker = false;
+            self.start_scan();
+        }
+        if cancelled || !open {
+            self.show_drive_picker = false;
+        }
     }
 
-    /// Treemap of folders: direct child folders of the current view root,
-    /// sized by total folder size. Click a folder to drill into it.
     /// Rebuild the parent -> children folder index when scan data changed.
     fn ensure_dir_index(&mut self) {
         if self.dir_index_version == self.data_version {
