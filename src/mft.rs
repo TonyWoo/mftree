@@ -389,6 +389,15 @@ mod imp {
     }
 
     pub fn scan(drive: &str, progress: &dyn Fn(u64) -> bool) -> Result<Vec<FileEntry>, String> {
+        // Phase timing goes to stderr so a console run shows where time goes.
+        macro_rules! phase {
+            ($t:ident, $name:expr) => {{
+                let d = $t.elapsed();
+                eprintln!("[sizetree] {}: {:.2}s", $name, d.as_secs_f64());
+                $t = std::time::Instant::now();
+            }};
+        }
+        let mut t = std::time::Instant::now();
         let vol = Volume::open(drive)?;
         let bs = vol.read_at(0, 512)?;
         let (bps, spc, mft_lcn, rec_size) = parse_bootsector(&bs)?;
@@ -396,6 +405,11 @@ mod imp {
         let raw0 = vol.read_at((mft_lcn as u64) * cluster, rec_size)?;
         let rec0 = apply_fixup(&raw0, bps).ok_or("MFT record 0 fixup failed")?;
         let runs = mft_runs(&rec0)?;
+        eprintln!(
+            "[sizetree] MFT runs: {}, total MiB: {}",
+            runs.len(),
+            runs.iter().map(|(_, n)| n).sum::<u64>() * cluster / 1024 / 1024
+        );
 
         let total_clusters: u64 = runs.iter().map(|(_, n)| n).sum();
         let mut mft =
@@ -404,6 +418,7 @@ mod imp {
             mft.extend_from_slice(&vol.read_at(*lcn * cluster, (*ncl * cluster) as usize)?);
         }
         drop(vol);
+        phase!(t, "read MFT");
 
         let nrec = mft.len() / rec_size;
         let mut raws: HashMap<u64, RawEntry> = HashMap::with_capacity(nrec / 2);
@@ -417,6 +432,8 @@ mod imp {
             }
         }
         progress(nrec as u64);
+        eprintln!("[sizetree] parsed records: {}", raws.len());
+        phase!(t, "parse records");
 
         // children index for directory aggregation
         let mut children: HashMap<u64, Vec<u64>> = HashMap::new();
@@ -489,6 +506,7 @@ mod imp {
         }
         let mut dmemo = HashMap::new();
         order.sort_by_key(|n| std::cmp::Reverse(depth(*n, &raws, &mut dmemo)));
+        phase!(t, "depth sort");
         for &num in &order {
             let mut s = raws[&num].size;
             let mut a = raws[&num].alloc;
@@ -501,6 +519,7 @@ mod imp {
             total_size.insert(num, s);
             total_alloc.insert(num, a);
         }
+        phase!(t, "aggregate dirs");
 
         let mut memo = HashMap::new();
         let mut out = Vec::with_capacity(raws.len());
@@ -521,6 +540,7 @@ mod imp {
                 is_dir: e.is_dir,
             });
         }
+        phase!(t, "build paths");
         Ok(out)
     }
 }
