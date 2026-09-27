@@ -611,28 +611,35 @@ impl App {
             self.rows_key = Some(key);
         }
         let mut menu_hit: Option<(MenuAction, String, u64, bool)> = None;
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("filelist")
-                .striped(true)
-                .num_columns(3)
-                .min_col_width(56.0)
-                .show(ui, |ui| {
-                    sort_header(ui, &mut col, &mut asc, SortCol::Name, "Name");
-                    sort_header(ui, &mut col, &mut asc, SortCol::Size, "Size");
-                    sort_header(ui, &mut col, &mut asc, SortCol::Pct, "%");
-                    ui.end_row();
-                    let total_size = self.total_size;
-                    let total = self.rows_total;
-                    let nrows = self.rows_cache.len();
-                    let mut drill: Option<String> = None;
-                    for k in 0..nrows {
-                        let idx = self.rows_cache[k];
-                        let it: &Item = match tab {
-                            ListTab::Files => &self.files[idx],
-                            ListTab::Folders => &self.dirs[idx],
-                        };
-                        let sel = self.selected == Some((tab, idx));
-                        let label = short_name(&it.path).to_string();
+        let mut drill: Option<String> = None;
+        let total_size = self.total_size;
+        let total = self.rows_total;
+        let nrows = self.rows_cache.len();
+        // Reserve room for the footer label below the table.
+        let table_h = (ui.available_height() - 22.0).max(80.0);
+        egui_extras::TableBuilder::new(ui)
+            .striped(true)
+            .resizable(true)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(egui_extras::Column::remainder().clip(true))
+            .column(egui_extras::Column::auto())
+            .column(egui_extras::Column::auto())
+            .max_scroll_height(table_h)
+            .header(20.0, |mut header| {
+                header.col(|ui| sort_header(ui, &mut col, &mut asc, SortCol::Name, "Name"));
+                header.col(|ui| sort_header(ui, &mut col, &mut asc, SortCol::Size, "Size"));
+                header.col(|ui| sort_header(ui, &mut col, &mut asc, SortCol::Pct, "%"));
+            })
+            .body(|body| {
+                body.rows(18.0, nrows, |mut row| {
+                    let idx = self.rows_cache[row.index()];
+                    let it: &Item = match tab {
+                        ListTab::Files => &self.files[idx],
+                        ListTab::Folders => &self.dirs[idx],
+                    };
+                    let sel = self.selected == Some((tab, idx));
+                    row.col(|ui| {
+                        let label = short_name(&it.path);
                         let resp = ui.selectable_label(sel, label);
                         if resp.clicked() {
                             self.selected = Some((tab, idx));
@@ -669,23 +676,25 @@ impl App {
                         if let Some(a) = action {
                             menu_hit = Some((a, path, size, is_dir));
                         }
+                    });
+                    row.col(|ui| {
                         ui.monospace(human(it.size));
+                    });
+                    row.col(|ui| {
                         ui.monospace(Self::pct_str(it.size, total_size));
-                        ui.end_row();
-                    }
-                    if let Some(d) = drill {
-                        self.view_root = Some(d);
-                        self.selected = None;
-                    }
-                    self.scroll_to_sel = false;
-                    ui.end_row();
-                    ui.label(
-                        egui::RichText::new(format!("{nrows} of {total} shown"))
-                            .small()
-                            .weak(),
-                    );
+                    });
                 });
-        });
+            });
+        ui.label(
+            egui::RichText::new(format!("{nrows} of {total} shown"))
+                .small()
+                .weak(),
+        );
+        if let Some(d) = drill {
+            self.view_root = Some(d);
+            self.selected = None;
+        }
+        self.scroll_to_sel = false;
         if let Some((a, path, size, is_dir)) = menu_hit {
             match a {
                 MenuAction::Reveal => reveal(&path),
