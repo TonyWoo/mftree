@@ -9,10 +9,12 @@
     windows_subsystem = "windows"
 )]
 
+mod i18n;
 mod mft;
 mod treemap;
 
 use eframe::egui;
+use i18n::{tr, Lang, S};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -282,6 +284,10 @@ struct App {
     dir_index_version: u64,
     /// Startup drive-picker dialog (shown once at launch).
     show_drive_picker: bool,
+    /// UI language (toggle in the top bar).
+    lang: Lang,
+    /// Folder tree: scroll the selected row into view (one-shot).
+    tree_scroll_to_sel: bool,
 }
 
 impl App {
@@ -308,7 +314,7 @@ impl App {
             sort_col: SortCol::Size,
             sort_asc: false,
             filter: String::new(),
-            status: "Pick a drive and hit Scan.".to_string(),
+            status: tr(Lang::Zh, S::StatusPickDrive).to_string(),
             rx: None,
             cancel: None,
             started: None,
@@ -321,6 +327,8 @@ impl App {
             dir_children: HashMap::new(),
             dir_index_version: u64::MAX,
             show_drive_picker: true,
+            lang: Lang::Zh,
+            tree_scroll_to_sel: false,
         };
         app.refresh_disk_space();
         app
@@ -355,7 +363,7 @@ impl App {
         self.selected = None;
         self.started = Some(Instant::now());
         let drive = self.drive.clone();
-        self.status = format!("Scanning {drive} …");
+        self.status = i18n::scanning(self.lang, &drive);
         std::thread::spawn(move || {
             let r = mft::scan(&drive, &|n| {
                 let _ = tx.send(ScanMsg::Progress(n));
@@ -405,14 +413,18 @@ impl App {
                     self.data_version += 1;
                     let nf = self.files.len();
                     let nd = self.dirs.len();
-                    self.status = format!(
-                        "Done: {nf} files, {nd} folders, {} in {:.1}s",
-                        human(self.total_size),
-                        self.scan_secs
+                    self.status = i18n::done_status(
+                        self.lang,
+                        nf,
+                        nd,
+                        human(self.total_size).trim(),
+                        self.scan_secs,
                     );
                 }
-                Err(e) if e == "cancelled" => self.status = "Scan cancelled.".to_string(),
-                Err(e) => self.status = format!("Scan failed: {e}"),
+                Err(e) if e == "cancelled" => {
+                    self.status = tr(self.lang, S::StatusScanCancelled).to_string()
+                }
+                Err(e) => self.status = i18n::scan_failed(self.lang, &e),
             }
         } else if self.scanning {
             ctx.request_repaint();
@@ -496,9 +508,9 @@ impl App {
             match r {
                 Ok(_) => {
                     self.remove_item(&cd.path, cd.is_dir);
-                    self.status = format!("已永久删除：{}", short_name(&cd.path));
+                    self.status = i18n::perm_deleted(self.lang, short_name(&cd.path));
                 }
-                Err(e) => self.status = format!("删除失败：{e}"),
+                Err(e) => self.status = i18n::perm_delete_failed(self.lang, &e),
             }
         }
     }
@@ -507,9 +519,9 @@ impl App {
         match trash::delete(path) {
             Ok(_) => {
                 self.remove_item(path, is_dir);
-                self.status = format!("已移到回收站：{}", short_name(path));
+                self.status = i18n::trashed(self.lang, short_name(path));
             }
-            Err(e) => self.status = format!("移到回收站失败：{e}"),
+            Err(e) => self.status = i18n::trash_failed(self.lang, &e),
         }
     }
 
@@ -556,8 +568,8 @@ impl App {
             .map(|h| format!("{h}/{fname}"))
             .unwrap_or(fname.clone());
         match std::fs::write(&dest, out) {
-            Ok(_) => self.status = format!("已导出 {} 条记录 → {dest}", items.len()),
-            Err(e) => self.status = format!("导出失败：{e}"),
+            Ok(_) => self.status = i18n::exported(self.lang, items.len(), &dest),
+            Err(e) => self.status = i18n::export_failed(self.lang, &e),
         }
     }
 
@@ -568,31 +580,31 @@ impl App {
         };
         let mut close = false;
         let mut confirmed = false;
-        egui::Window::new("永久删除？")
+        egui::Window::new(tr(self.lang, S::DeleteTitle))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.label(&cd.path);
                 ui.label(
-                    egui::RichText::new(format!(
-                        "{} · {}",
+                    egui::RichText::new(i18n::delete_meta(
+                        self.lang,
                         human(cd.size).trim(),
-                        if cd.is_dir { "文件夹" } else { "文件" }
+                        cd.is_dir,
                     ))
                     .weak(),
                 );
                 ui.label(
-                    egui::RichText::new("此操作不可恢复，文件将直接删除而不进回收站。")
+                    egui::RichText::new(tr(self.lang, S::DeleteWarning))
                         .color(egui::Color32::from_rgb(255, 150, 150)),
                 );
                 ui.horizontal(|ui| {
-                    if ui.button("取消").clicked() {
+                    if ui.button(tr(self.lang, S::Cancel)).clicked() {
                         close = true;
                     }
                     if ui
                         .add(
-                            egui::Button::new("永久删除")
+                            egui::Button::new(tr(self.lang, S::DeleteConfirm))
                                 .fill(egui::Color32::from_rgb(180, 60, 60)),
                         )
                         .clicked()
@@ -633,21 +645,33 @@ impl App {
                 }
             });
             if let Some(g) = go {
-                self.view_root = g;
-                self.selected = None;
+                match g {
+                    Some(p) => {
+                        self.view_root = Some(p.clone());
+                        self.sync_tree_to(&p, None);
+                    }
+                    None => {
+                        self.view_root = None;
+                        self.selected = None;
+                    }
+                }
             }
             ui.separator();
         }
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.list_tab, ListTab::Files, "Files");
-            ui.selectable_value(&mut self.list_tab, ListTab::Folders, "Folders");
+            ui.selectable_value(&mut self.list_tab, ListTab::Files, tr(self.lang, S::Files));
+            ui.selectable_value(
+                &mut self.list_tab,
+                ListTab::Folders,
+                tr(self.lang, S::Folders),
+            );
             if self.list_tab == ListTab::Folders {
-                ui.checkbox(&mut self.tree_view, "🌲 树形");
+                ui.checkbox(&mut self.tree_view, tr(self.lang, S::TreeView));
             }
         });
         ui.add(
             egui::TextEdit::singleline(&mut self.filter)
-                .hint_text("Filter…")
+                .hint_text(tr(self.lang, S::FilterHint))
                 .desired_width(f32::INFINITY),
         );
         let tab = self.list_tab;
@@ -678,7 +702,7 @@ impl App {
             self.rows_key = Some(key);
         }
         let mut menu_hit: Option<(MenuAction, String, u64, bool)> = None;
-        let mut drill: Option<String> = None;
+        let mut drill: Option<(String, usize)> = None;
         if tab == ListTab::Folders && self.tree_view {
             let table_h = (ui.available_height() - 22.0).max(80.0);
             egui::ScrollArea::vertical()
@@ -687,7 +711,7 @@ impl App {
                     self.draw_folder_tree(ui, &mut menu_hit, &mut drill);
                 });
             ui.label(
-                egui::RichText::new(format!("{} folders", self.dirs.len()))
+                egui::RichText::new(i18n::folders_count(self.lang, self.dirs.len()))
                     .small()
                     .weak(),
             );
@@ -706,9 +730,33 @@ impl App {
                 .column(egui_extras::Column::auto())
                 .max_scroll_height(table_h)
                 .header(20.0, |mut header| {
-                    header.col(|ui| sort_header(ui, &mut col, &mut asc, SortCol::Name, "Name"));
-                    header.col(|ui| sort_header(ui, &mut col, &mut asc, SortCol::Size, "Size"));
-                    header.col(|ui| sort_header(ui, &mut col, &mut asc, SortCol::Pct, "%"));
+                    header.col(|ui| {
+                        sort_header(
+                            ui,
+                            &mut col,
+                            &mut asc,
+                            SortCol::Name,
+                            tr(self.lang, S::ColName),
+                        )
+                    });
+                    header.col(|ui| {
+                        sort_header(
+                            ui,
+                            &mut col,
+                            &mut asc,
+                            SortCol::Size,
+                            tr(self.lang, S::ColSize),
+                        )
+                    });
+                    header.col(|ui| {
+                        sort_header(
+                            ui,
+                            &mut col,
+                            &mut asc,
+                            SortCol::Pct,
+                            tr(self.lang, S::ColPct),
+                        )
+                    });
                 })
                 .body(|body| {
                     body.rows(18.0, nrows, |mut row| {
@@ -725,7 +773,7 @@ impl App {
                                 self.selected = Some((tab, idx));
                             }
                             if tab == ListTab::Folders && resp.double_clicked() {
-                                drill = Some(it.path.clone());
+                                drill = Some((it.path.clone(), idx));
                             }
                             if sel && self.scroll_to_sel {
                                 ui.scroll_to_rect(resp.rect, Some(egui::Align::Center));
@@ -735,18 +783,24 @@ impl App {
                             let size = it.size;
                             let mut action = None;
                             resp.context_menu(|ui| {
-                                if ui.button("在资源管理器中显示").clicked() {
+                                if ui.button(tr(self.lang, S::Reveal)).clicked() {
                                     action = Some(MenuAction::Reveal);
                                 }
                                 ui.separator();
                                 if ui
-                                    .add_enabled(!scanning, egui::Button::new("移到回收站"))
+                                    .add_enabled(
+                                        !scanning,
+                                        egui::Button::new(tr(self.lang, S::Trash)),
+                                    )
                                     .clicked()
                                 {
                                     action = Some(MenuAction::Trash);
                                 }
                                 if ui
-                                    .add_enabled(!scanning, egui::Button::new("永久删除…"))
+                                    .add_enabled(
+                                        !scanning,
+                                        egui::Button::new(tr(self.lang, S::PermDeleteMenu)),
+                                    )
                                     .clicked()
                                 {
                                     action = Some(MenuAction::PermDelete);
@@ -766,14 +820,13 @@ impl App {
                     });
                 });
             ui.label(
-                egui::RichText::new(format!("{nrows} of {total} shown"))
+                egui::RichText::new(i18n::rows_shown(self.lang, nrows, total))
                     .small()
                     .weak(),
             );
         }
-        if let Some(d) = drill {
-            self.view_root = Some(d);
-            self.selected = None;
+        if let Some((d, idx)) = drill {
+            self.drill_into(d, Some(idx));
         }
         self.scroll_to_sel = false;
         if let Some((a, path, size, is_dir)) = menu_hit {
@@ -790,8 +843,6 @@ impl App {
     }
 
     /// Startup dialog: pick a drive to scan. Drives with <10% free space
-    /// are flagged red.
-    /// Startup dialog: pick a drive to scan. Drives with <10% free space
     /// are flagged red. Clicking a drive selects it and closes the dialog;
     /// the Scan button selects and starts scanning immediately.
     fn draw_drive_picker(&mut self, ctx: &egui::Context) {
@@ -799,14 +850,14 @@ impl App {
         let mut picked: Option<String> = None;
         let mut scan_now = false;
         let mut cancelled = false;
-        egui::Window::new("Select drive to scan")
+        egui::Window::new(tr(self.lang, S::PickerTitle))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.set_min_width(360.0);
-                ui.label("Click a drive to select it.");
+                ui.label(tr(self.lang, S::PickerHint));
                 ui.add_space(6.0);
                 egui::Grid::new("drive_picker_grid")
                     .num_columns(3)
@@ -827,10 +878,10 @@ impl App {
                             }
                             if total > 0 {
                                 usage_bar(ui, total, free, 120.0);
-                                let t = egui::RichText::new(format!(
-                                    "{} free of {}",
+                                let t = egui::RichText::new(i18n::free_of(
+                                    self.lang,
                                     human(free).trim(),
-                                    human(total).trim()
+                                    human(total).trim(),
                                 ))
                                 .small();
                                 ui.label(if low {
@@ -847,10 +898,13 @@ impl App {
                     });
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("🔍 Scan").clicked() {
+                    if ui
+                        .button(format!("🔍 {}", tr(self.lang, S::Scan)))
+                        .clicked()
+                    {
                         scan_now = true;
                     }
-                    if ui.button("Cancel").clicked() {
+                    if ui.button(tr(self.lang, S::Cancel)).clicked() {
                         cancelled = true;
                     }
                 });
@@ -892,15 +946,56 @@ impl App {
     fn treemap_root(&self) -> String {
         match &self.view_root {
             Some(r) => r.clone(),
-            None => {
-                let d = self.drive.trim_end_matches(':');
-                if d == "/" || d.is_empty() {
-                    "/".to_string()
-                } else {
-                    format!("{d}:")
-                }
-            }
+            None => self.drive_root(),
         }
+    }
+
+    /// Drive root path ("C:" on Windows, "/" elsewhere). The folder tree is
+    /// always rooted here so a treemap drill can reveal the folder's place
+    /// in the full hierarchy.
+    fn drive_root(&self) -> String {
+        let d = self.drive.trim_end_matches(':');
+        if d == "/" || d.is_empty() {
+            "/".to_string()
+        } else {
+            format!("{d}:")
+        }
+    }
+
+    /// Linear index lookup of a folder path in `self.dirs` (size-desc).
+    fn dir_idx(&self, path: &str) -> Option<usize> {
+        self.dirs.iter().position(|d| d.path == path)
+    }
+
+    /// Sync the folder tree to `path`: expand the ancestor chain, select the
+    /// folder and scroll it into view.
+    fn sync_tree_to(&mut self, path: &str, idx: Option<usize>) {
+        let idx = idx.or_else(|| self.dir_idx(path));
+        self.selected = idx.map(|i| (ListTab::Folders, i));
+        self.ensure_dir_index();
+        let root = self.drive_root();
+        let mut p = path.to_string();
+        loop {
+            self.expanded.insert(p.clone());
+            if p == root {
+                break;
+            }
+            let up = parent_dir(&p).to_string();
+            if up == p {
+                break; // safety; shouldn't happen
+            }
+            p = up;
+        }
+        self.tree_scroll_to_sel = true;
+    }
+
+    /// Drill into a folder: re-root the treemap/list views there and sync
+    /// the folder tree to it.
+    fn drill_into(&mut self, path: String, idx: Option<usize>) {
+        self.view_root = Some(path.clone());
+        self.list_tab = ListTab::Folders;
+        self.tree_view = true;
+        self.sync_tree_to(&path, idx);
     }
 
     /// Nested treemap of folders: child folders of the current view root,
@@ -910,7 +1005,7 @@ impl App {
     fn draw_treemap(&mut self, ui: &mut egui::Ui) {
         if self.dirs.is_empty() {
             ui.centered_and_justified(|ui| {
-                ui.label("No data yet — hit Scan.");
+                ui.label(tr(self.lang, S::NoData));
             });
             return;
         }
@@ -923,7 +1018,7 @@ impl App {
             .unwrap_or_default();
         if top.is_empty() {
             ui.centered_and_justified(|ui| {
-                ui.label("No subfolders here.");
+                ui.label(tr(self.lang, S::NoSubfolders));
             });
             return;
         }
@@ -933,7 +1028,7 @@ impl App {
         let origin = resp.rect.min;
         let painter = painter.clone();
         let mut menu_hit: Option<(MenuAction, String, u64, bool)> = None;
-        let mut drill: Option<String> = None;
+        let mut drill: Option<(String, usize)> = None;
         self.draw_treemap_level(
             ui,
             &painter,
@@ -947,9 +1042,8 @@ impl App {
             &mut menu_hit,
             &mut drill,
         );
-        if let Some(d) = drill {
-            self.view_root = Some(d);
-            self.selected = None;
+        if let Some((d, idx)) = drill {
+            self.drill_into(d, Some(idx));
         }
         if let Some((a, path, size, is_dir)) = menu_hit {
             match a {
@@ -964,7 +1058,11 @@ impl App {
         // legend: size gradient
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("small").small().weak());
+            ui.label(
+                egui::RichText::new(tr(self.lang, S::LegendSmall))
+                    .small()
+                    .weak(),
+            );
             let (rrect, _) = ui.allocate_exact_size(egui::vec2(120.0, 10.0), egui::Sense::hover());
             {
                 let p = ui.painter();
@@ -982,9 +1080,13 @@ impl App {
                     );
                 }
             }
-            ui.label(egui::RichText::new("large").small().weak());
             ui.label(
-                egui::RichText::new(format!("Top {} folders by size", top.len()))
+                egui::RichText::new(tr(self.lang, S::LegendLarge))
+                    .small()
+                    .weak(),
+            );
+            ui.label(
+                egui::RichText::new(i18n::top_n(self.lang, top.len()))
                     .small()
                     .weak(),
             );
@@ -1007,7 +1109,7 @@ impl App {
         h: f64,
         depth: usize,
         menu_hit: &mut Option<(MenuAction, String, u64, bool)>,
-        drill: &mut Option<String>,
+        drill: &mut Option<(String, usize)>,
     ) {
         if indices.is_empty() || w < 4.0 || h < 4.0 {
             return;
@@ -1058,22 +1160,25 @@ impl App {
                 );
             }
             if rr.clicked() {
-                *drill = Some(path.clone());
+                *drill = Some((path.clone(), idx));
             }
             let mut action = None;
             rr.context_menu(|ui| {
-                if ui.button("在资源管理器中显示").clicked() {
+                if ui.button(tr(self.lang, S::Reveal)).clicked() {
                     action = Some(MenuAction::Reveal);
                 }
                 ui.separator();
                 if ui
-                    .add_enabled(!scanning, egui::Button::new("移到回收站"))
+                    .add_enabled(!scanning, egui::Button::new(tr(self.lang, S::Trash)))
                     .clicked()
                 {
                     action = Some(MenuAction::Trash);
                 }
                 if ui
-                    .add_enabled(!scanning, egui::Button::new("永久删除…"))
+                    .add_enabled(
+                        !scanning,
+                        egui::Button::new(tr(self.lang, S::PermDeleteMenu)),
+                    )
                     .clicked()
                 {
                     action = Some(MenuAction::PermDelete);
@@ -1162,16 +1267,16 @@ impl App {
         &mut self,
         ui: &mut egui::Ui,
         menu_hit: &mut Option<(MenuAction, String, u64, bool)>,
-        drill: &mut Option<String>,
+        drill: &mut Option<(String, usize)>,
     ) {
         if self.dirs.is_empty() {
             ui.centered_and_justified(|ui| {
-                ui.label("No data yet — hit Scan.");
+                ui.label(tr(self.lang, S::NoData));
             });
             return;
         }
         self.ensure_dir_index();
-        let root = self.treemap_root();
+        let root = self.drive_root();
         self.draw_tree_node(ui, &root, 0, menu_hit, drill);
     }
 
@@ -1181,7 +1286,7 @@ impl App {
         parent: &str,
         indent: usize,
         menu_hit: &mut Option<(MenuAction, String, u64, bool)>,
-        drill: &mut Option<String>,
+        drill: &mut Option<(String, usize)>,
     ) {
         let total_kids = self.dir_children.get(parent).map(|v| v.len()).unwrap_or(0);
         let kids: Vec<usize> = self
@@ -1218,26 +1323,33 @@ impl App {
                 }
                 let sel = self.selected == Some((ListTab::Folders, idx));
                 let resp = ui.selectable_label(sel, &name);
+                if sel && self.tree_scroll_to_sel {
+                    ui.scroll_to_rect(resp.rect, Some(egui::Align::Center));
+                    self.tree_scroll_to_sel = false;
+                }
                 if resp.clicked() {
                     self.selected = Some((ListTab::Folders, idx));
                 }
                 if resp.double_clicked() {
-                    *drill = Some(path.clone());
+                    *drill = Some((path.clone(), idx));
                 }
                 let mut action = None;
                 resp.context_menu(|ui| {
-                    if ui.button("在资源管理器中显示").clicked() {
+                    if ui.button(tr(self.lang, S::Reveal)).clicked() {
                         action = Some(MenuAction::Reveal);
                     }
                     ui.separator();
                     if ui
-                        .add_enabled(!scanning, egui::Button::new("移到回收站"))
+                        .add_enabled(!scanning, egui::Button::new(tr(self.lang, S::Trash)))
                         .clicked()
                     {
                         action = Some(MenuAction::Trash);
                     }
                     if ui
-                        .add_enabled(!scanning, egui::Button::new("永久删除…"))
+                        .add_enabled(
+                            !scanning,
+                            egui::Button::new(tr(self.lang, S::PermDeleteMenu)),
+                        )
                         .clicked()
                     {
                         action = Some(MenuAction::PermDelete);
@@ -1259,7 +1371,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.add_space(indent as f32 * 16.0 + 20.0);
                 ui.label(
-                    egui::RichText::new(format!("… {} more", total_kids - shown))
+                    egui::RichText::new(i18n::n_more(self.lang, total_kids - shown))
                         .small()
                         .weak(),
                 );
@@ -1278,8 +1390,11 @@ impl eframe::App for App {
 
         egui::Panel::top("top").show(ui, |ui| {
             ui.horizontal(|ui| {
+                if ui.button(self.lang.toggle_label()).clicked() {
+                    self.lang = self.lang.toggle();
+                }
                 ui.heading("mftree");
-                egui::ComboBox::from_label("Drive")
+                egui::ComboBox::from_label(tr(self.lang, S::Drive))
                     .selected_text(&self.drive)
                     .show_ui(ui, |ui| {
                         for d in self.drives.clone() {
@@ -1295,7 +1410,7 @@ impl eframe::App for App {
                 if self.scanning {
                     if ui
                         .add(
-                            egui::Button::new("⏹ Cancel")
+                            egui::Button::new(format!("⏹ {}", tr(self.lang, S::Cancel)))
                                 .fill(egui::Color32::from_rgb(150, 60, 60)),
                         )
                         .clicked()
@@ -1303,18 +1418,24 @@ impl eframe::App for App {
                         if let Some(c) = &self.cancel {
                             c.store(true, Ordering::Relaxed);
                         }
-                        self.status = "Cancelling…".to_string();
+                        self.status = tr(self.lang, S::Cancelling).to_string();
                     }
                     ui.spinner();
-                    ui.label(format!("{} records…", self.progress));
+                    ui.label(i18n::records(self.lang, self.progress));
                 } else {
-                    let btn = ui.add_enabled(!self.scanning, egui::Button::new("🔍 Scan"));
+                    let btn = ui.add_enabled(
+                        !self.scanning,
+                        egui::Button::new(format!("🔍 {}", tr(self.lang, S::Scan))),
+                    );
                     if btn.clicked() {
                         self.start_scan();
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("⬇ Export CSV").clicked() {
+                    if ui
+                        .button(format!("⬇ {}", tr(self.lang, S::ExportCsv)))
+                        .clicked()
+                    {
                         self.export_csv();
                     }
                 });
@@ -1326,10 +1447,10 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(&self.drive).small().weak());
                     usage_bar(ui, total, free, ui.available_width() - 220.0);
-                    let txt = egui::RichText::new(format!(
-                        "{} free of {}",
+                    let txt = egui::RichText::new(i18n::free_of(
+                        self.lang,
                         human(free).trim(),
-                        human(total).trim()
+                        human(total).trim(),
                     ))
                     .small();
                     ui.label(if low {
