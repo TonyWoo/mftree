@@ -547,6 +547,95 @@ mod imp {
             assert_eq!(e.name, "OrchardCore");
             assert_eq!(e.parent, 5);
         }
+
+        #[test]
+        fn filename_falls_back_to_dos_short_name() {
+            // A DOS-only record keeps its short name rather than failing.
+            let dos = fake_filename_attr("ORchar~1", 5, 2);
+            let rec = fake_record(&[dos]);
+            let e = parse_record(&rec, 512).expect("must parse");
+            assert_eq!(e.name, "ORchar~1");
+        }
+
+        #[test]
+        fn ns_rank_orders_win32_above_dos() {
+            assert!(ns_rank(1) < ns_rank(2));
+            assert!(ns_rank(3) < ns_rank(2));
+            assert_eq!(ns_rank(1), ns_rank(3));
+            assert!(ns_rank(0) < ns_rank(2));
+        }
+
+        #[test]
+        fn record_rejects_bad_magic() {
+            let mut rec = fake_record(&[fake_filename_attr("a", 5, 1)]);
+            rec[0..4].copy_from_slice(b"BAAD");
+            assert!(parse_record(&rec, 512).is_none());
+        }
+
+        #[test]
+        fn record_rejects_not_in_use() {
+            let mut rec = fake_record(&[fake_filename_attr("a", 5, 1)]);
+            rec[0x16] = 0x00; // clear the in-use flag
+            rec[0x17] = 0x00;
+            assert!(parse_record(&rec, 512).is_none());
+        }
+
+        #[test]
+        fn fixup_applies_replacement() {
+            let rec = fake_record(&[fake_filename_attr("a", 5, 1)]);
+            let fixed = apply_fixup(&rec, 512).expect("must apply");
+            assert_eq!(u16_at(&fixed, 510), 0x5678);
+        }
+
+        #[test]
+        fn fixup_rejects_torn_record() {
+            let mut rec = fake_record(&[fake_filename_attr("a", 5, 1)]);
+            rec[510] = 0x00; // corrupt the sector-end update sequence
+            rec[511] = 0x00;
+            assert!(apply_fixup(&rec, 512).is_none());
+        }
+
+        /// Build a minimal NTFS boot sector: 512 B/sector, 8 sectors/cluster,
+        /// MFT at LCN 786432, 1024-byte MFT records.
+        fn fake_bootsector() -> Vec<u8> {
+            let mut bs = vec![0u8; 512];
+            bs[3..7].copy_from_slice(b"NTFS");
+            bs[0x0B..0x0D].copy_from_slice(&512u16.to_le_bytes());
+            bs[0x0D] = 8;
+            bs[0x30..0x38].copy_from_slice(&786432i64.to_le_bytes());
+            bs[0x40] = 0xF6; // clusters per MFT record = -10 -> 1024 bytes
+            bs
+        }
+
+        #[test]
+        fn bootsector_parses_fields() {
+            let (bps, spc, lcn, rec) = parse_bootsector(&fake_bootsector()).expect("must parse");
+            assert_eq!((bps, spc, lcn, rec), (512, 8, 786432, 1024));
+        }
+
+        #[test]
+        fn bootsector_rejects_non_ntfs() {
+            assert!(parse_bootsector(&vec![0u8; 512]).is_err());
+            assert!(parse_bootsector(&vec![0u8; 100]).is_err());
+        }
+
+        #[test]
+        fn runs_decode_single() {
+            // 0x11: 1 length byte, 1 offset byte; length 8, delta 5
+            assert_eq!(parse_runs(&[0x11, 0x08, 0x05]), vec![(5, 8)]);
+        }
+
+        #[test]
+        fn runs_decode_negative_delta() {
+            // delta 0xFF sign-extends to -1
+            assert_eq!(parse_runs(&[0x11, 0x04, 0xFF]), vec![(-1, 4)]);
+        }
+
+        #[test]
+        fn runs_decode_multiple_and_stop_at_terminator() {
+            let runs = parse_runs(&[0x11, 0x08, 0x05, 0x11, 0x04, 0xFF, 0x00]);
+            assert_eq!(runs, vec![(5, 8), (-1, 4)]);
+        }
     }
 }
 
