@@ -4,13 +4,109 @@
 //! enumerating the whole volume in seconds without walking directories.
 //! On other platforms: falls back to a plain recursive directory walk.
 
+use std::sync::{Arc, OnceLock};
+
+/// A path that is either immediately available (directories) or assembled
+/// only when a caller needs a file's full path.
+#[derive(Clone, Debug)]
+pub enum EntryPath {
+    Ready(String),
+    Lazy {
+        parent: Arc<str>,
+        name: String,
+        resolved: Arc<OnceLock<String>>,
+    },
+}
+
+impl EntryPath {
+    pub fn ready(path: String) -> Self {
+        Self::Ready(path)
+    }
+
+    pub fn lazy(parent: Arc<str>, name: String) -> Self {
+        Self::Lazy {
+            parent,
+            name,
+            resolved: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Resolve the complete path, caching it only for lazy file entries.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Ready(path) => path,
+            Self::Lazy {
+                parent,
+                name,
+                resolved,
+            } => resolved
+                .get_or_init(|| {
+                    let mut path = String::with_capacity(parent.len() + name.len() + 1);
+                    path.push_str(parent);
+                    if !path.ends_with('\\') {
+                        path.push('\\');
+                    }
+                    path.push_str(name);
+                    path
+                })
+                .as_str(),
+        }
+    }
+
+    /// Name without resolving a lazy file's parent chain.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Ready(path) => path.rsplit(['\\', '/']).next().unwrap_or(path),
+            Self::Lazy { name, .. } => name,
+        }
+    }
+
+    /// Parent directory for lazy files; directories derive it from their path.
+    pub fn parent(&self) -> Option<&str> {
+        match self {
+            Self::Ready(path) => {
+                let name = path.rsplit(['\\', '/']).next().unwrap_or(path);
+                let parent = path[..path.len() - name.len()].trim_end_matches(['\\', '/']);
+                if parent.is_empty() {
+                    Some("/")
+                } else {
+                    Some(parent)
+                }
+            }
+            Self::Lazy { parent, .. } => Some(parent),
+        }
+    }
+}
+
+impl std::ops::Deref for EntryPath {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct FileEntry {
-    pub path: String,
+    pub path: EntryPath,
     pub size: u64,     // logical bytes
     pub alloc: u64,    // allocated bytes on disk
     pub modified: u64, // unix seconds, 0 = unknown
     pub is_dir: bool,
+    // Recursive descendant counts; 0 for plain files. Computed once during
+    // scan aggregation so the UI never has to walk parent chains per file.
+    pub file_count: u64,
+    pub folder_count: u64,
+}
+
+/// The current long-running stage of a disk scan.
+#[derive(Clone, Copy, Debug)]
+pub enum ScanPhase {
+    ReadingRecords,
+    IndexingFolders,
+    AggregatingFolders,
+    BuildingPaths,
+    PreparingResults,
 }
 
 // ---------------------------------------------------------------------------
@@ -19,10 +115,11 @@ pub struct FileEntry {
 
 #[cfg(windows)]
 mod imp {
-    use super::FileEntry;
+    use super::{EntryPath, FileEntry, ScanPhase};
     use std::collections::{HashMap, HashSet};
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
+    use std::sync::Arc;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, GetDiskFreeSpaceExW, GetLogicalDriveStringsW, ReadFile, SetFilePointerEx,
@@ -102,9 +199,14 @@ mod imp {
 
         fn read_at(&self, offset: u64, size: usize) -> Result<Vec<u8>, String> {
             let mut out = vec![0u8; size];
+            self.read_at_into(offset, &mut out)?;
+            Ok(out)
+        }
+
+        fn read_at_into(&self, offset: u64, out: &mut [u8]) -> Result<(), String> {
             let mut done = 0usize;
-            while done < size {
-                let chunk = (size - done).min(64 * 1024 * 1024) as u32;
+            while done < out.len() {
+                let chunk = (out.len() - done).min(64 * 1024 * 1024) as u32;
                 let ok = unsafe {
                     SetFilePointerEx(
                         self.h,
@@ -131,7 +233,7 @@ mod imp {
                 }
                 done += chunk as usize;
             }
-            Ok(out)
+            Ok(())
         }
     }
 
@@ -388,7 +490,32 @@ mod imp {
         })
     }
 
-    pub fn scan(drive: &str, progress: &dyn Fn(u64) -> bool) -> Result<Vec<FileEntry>, String> {
+    /// Parse a consecutive, record-aligned MFT slice. Each caller owns its
+    /// scratch buffer, so independent slices can be parsed in parallel.
+    fn parse_records(
+        records: &[u8],
+        first_record: u64,
+        rec_size: usize,
+        bps: u32,
+    ) -> Vec<(u64, RawEntry)> {
+        let mut scratch = Vec::with_capacity(rec_size);
+        let mut entries = Vec::new();
+        for (index, record) in records.chunks_exact(rec_size).enumerate() {
+            if record.len() < 0x18 || &record[..4] != b"FILE" || u16_at(record, 0x16) & 0x01 == 0 {
+                continue;
+            }
+            if let Some(entry) = parse_record_with_scratch(record, bps, &mut scratch) {
+                entries.push((first_record + index as u64, entry));
+            }
+        }
+        entries
+    }
+
+    pub fn scan(
+        drive: &str,
+        progress: &dyn Fn(u64) -> bool,
+        phase: &dyn Fn(ScanPhase),
+    ) -> Result<Vec<FileEntry>, String> {
         let vol = Volume::open(drive)?;
         let bs = vol.read_at(0, 512)?;
         let (bps, spc, mft_lcn, rec_size) = parse_bootsector(&bs)?;
@@ -398,113 +525,174 @@ mod imp {
         let runs = mft_runs(&rec0)?;
 
         let total_clusters: u64 = runs.iter().map(|(_, n)| n).sum();
-        let mut mft =
-            Vec::with_capacity((total_clusters * cluster).min(512 * 1024 * 1024) as usize);
+        let nrec = (total_clusters * cluster) as usize / rec_size;
+        let mut raws: HashMap<u64, RawEntry> = HashMap::with_capacity(nrec / 2);
+        let mut read_buf = vec![0u8; 64 * 1024 * 1024];
+        let mut scratch = Vec::with_capacity(rec_size);
+        let mut pending = Vec::with_capacity(rec_size);
+        let mut record_num = 0u64;
+        let workers = std::thread::available_parallelism()
+            .map(|count| count.get().min(8))
+            .unwrap_or(1);
+        phase(ScanPhase::ReadingRecords);
         for (lcn, ncl) in &runs {
-            mft.extend_from_slice(&vol.read_at(*lcn * cluster, (*ncl * cluster) as usize)?);
+            let mut offset = *lcn * cluster;
+            let mut remaining = *ncl * cluster;
+            while remaining > 0 {
+                let size = remaining.min(read_buf.len() as u64) as usize;
+                vol.read_at_into(offset, &mut read_buf[..size])?;
+                let mut data = &read_buf[..size];
+                if !pending.is_empty() {
+                    let need = rec_size - pending.len();
+                    let take = need.min(data.len());
+                    pending.extend_from_slice(&data[..take]);
+                    data = &data[take..];
+                    if pending.len() == rec_size {
+                        if record_num % 4096 == 0 && !progress(record_num) {
+                            return Err("cancelled".to_string());
+                        }
+                        if let Some(entry) = parse_record_with_scratch(&pending, bps, &mut scratch)
+                        {
+                            raws.insert(record_num, entry);
+                        }
+                        record_num += 1;
+                        pending.clear();
+                    }
+                }
+                let complete = data.len() / rec_size * rec_size;
+                let records = &data[..complete];
+                let count = records.len() / rec_size;
+                if count > 0 {
+                    if !progress(record_num) {
+                        return Err("cancelled".to_string());
+                    }
+                    let worker_count = workers.min(count);
+                    let records_per_worker = count.div_ceil(worker_count);
+                    let parsed =
+                        std::thread::scope(|scope| {
+                            let mut handles = Vec::with_capacity(worker_count);
+                            for (index, slice) in
+                                records.chunks(records_per_worker * rec_size).enumerate()
+                            {
+                                let first_record = record_num + (index * records_per_worker) as u64;
+                                handles.push(scope.spawn(move || {
+                                    parse_records(slice, first_record, rec_size, bps)
+                                }));
+                            }
+                            let mut entries = Vec::new();
+                            for handle in handles {
+                                entries.extend(
+                                    handle
+                                        .join()
+                                        .map_err(|_| "MFT parser worker panicked".to_string())?,
+                                );
+                            }
+                            Ok::<_, String>(entries)
+                        })?;
+                    raws.extend(parsed);
+                    record_num += count as u64;
+                }
+                pending.extend_from_slice(&data[complete..]);
+                offset += size as u64;
+                remaining -= size as u64;
+            }
         }
         drop(vol);
-
-        let nrec = mft.len() / rec_size;
-        let mut raws: HashMap<u64, RawEntry> = HashMap::with_capacity(nrec / 2);
-        let mut scratch = Vec::with_capacity(rec_size);
-        for (i, chunk) in mft.chunks_exact(rec_size).enumerate() {
-            if i % 4096 == 0 && !progress(i as u64) {
-                return Err("cancelled".to_string());
-            }
-            if let Some(e) = parse_record_with_scratch(chunk, bps, &mut scratch) {
-                raws.insert(i as u64, e);
-            }
-        }
         progress(nrec as u64);
 
         // children index for directory aggregation
+        phase(ScanPhase::IndexingFolders);
         let mut children: HashMap<u64, Vec<u64>> = HashMap::new();
         for (&num, e) in &raws {
             children.entry(e.parent).or_default().push(num);
         }
 
-        // full paths via parent chain (5 = root)
-        fn path_of(
-            num: u64,
-            raws: &HashMap<u64, RawEntry>,
-            drive: &str,
-            memo: &mut HashMap<u64, String>,
-        ) -> String {
-            if let Some(p) = memo.get(&num) {
-                return p.clone();
-            }
-            let mut parts: Vec<String> = Vec::new();
-            let mut cur = num;
-            let mut seen = HashSet::new();
-            while cur != 5 && seen.insert(cur) {
-                match raws.get(&cur) {
-                    Some(e) => {
-                        parts.push(e.name.clone());
-                        cur = e.parent;
-                    }
-                    None => break,
-                }
-                if parts.len() > 512 {
-                    break;
-                }
-            }
-            parts.reverse();
-            let mut p = format!(r"{}:\", drive.trim_end_matches(':'));
-            for part in parts {
-                p.push_str(&part);
-                p.push('\\');
-            }
-            let p = p.trim_end_matches('\\').to_string();
-            memo.insert(num, p.clone());
-            p
-        }
-
-        // aggregate directory sizes (post-order, iterative)
+        // Aggregate directory sizes in a linear post-order traversal. Sorting
+        // every record by repeatedly walking its parent chain dominates scans
+        // with millions of files.
+        phase(ScanPhase::AggregatingFolders);
         let mut total_size: HashMap<u64, u64> = HashMap::new();
         let mut total_alloc: HashMap<u64, u64> = HashMap::new();
-        let mut order: Vec<u64> = raws.keys().cloned().collect();
-        // process leaves first: sort by depth descending
-        fn depth(num: u64, raws: &HashMap<u64, RawEntry>, memo: &mut HashMap<u64, usize>) -> usize {
-            if let Some(&d) = memo.get(&num) {
-                return d;
+        // Recursive file/folder counts, aggregated the same way as size and
+        // alloc: integer additions over the post-order traversal, so the UI
+        // never needs to walk a path string per file to answer "how many
+        // items live under this folder".
+        let mut total_files: HashMap<u64, u64> = HashMap::new();
+        let mut total_folders: HashMap<u64, u64> = HashMap::new();
+        let mut order = Vec::with_capacity(raws.len());
+        let mut visited = HashSet::with_capacity(raws.len());
+        for &start in raws.keys() {
+            if !visited.insert(start) {
+                continue;
             }
-            let mut d = 0;
-            let mut cur = num;
-            let mut seen = HashSet::new();
-            while cur != 5 && seen.insert(cur) {
-                match raws.get(&cur) {
-                    Some(e) => {
-                        cur = e.parent;
-                        d += 1;
+            let mut stack = vec![(start, false)];
+            while let Some((num, expanded)) = stack.pop() {
+                if expanded {
+                    order.push(num);
+                    continue;
+                }
+                stack.push((num, true));
+                if let Some(descendants) = children.get(&num) {
+                    for &child in descendants {
+                        if visited.insert(child) {
+                            stack.push((child, false));
+                        }
                     }
-                    None => break,
-                }
-                if d > 512 {
-                    break;
                 }
             }
-            memo.insert(num, d);
-            d
         }
-        let mut dmemo = HashMap::new();
-        order.sort_by_key(|n| std::cmp::Reverse(depth(*n, &raws, &mut dmemo)));
         for &num in &order {
             let mut s = raws[&num].size;
             let mut a = raws[&num].alloc;
+            let mut fc = 0u64;
+            let mut dc = 0u64;
             if let Some(ch) = children.get(&num) {
                 for c in ch {
                     s += total_size.get(c).copied().unwrap_or(0);
                     a += total_alloc.get(c).copied().unwrap_or(0);
+                    if raws[c].is_dir {
+                        dc += 1 + total_folders.get(c).copied().unwrap_or(0);
+                        fc += total_files.get(c).copied().unwrap_or(0);
+                    } else {
+                        fc += 1;
+                    }
                 }
             }
             total_size.insert(num, s);
             total_alloc.insert(num, a);
+            total_files.insert(num, fc);
+            total_folders.insert(num, dc);
         }
 
-        let mut memo = HashMap::new();
+        let root = format!(r"{}:", drive.trim_end_matches(':'));
+        phase(ScanPhase::BuildingPaths);
+        let mut memo = HashMap::with_capacity(raws.len() / 8);
+        let root_path: Arc<str> = Arc::from(root.as_str());
+        memo.insert(5, root_path.clone());
         let mut out = Vec::with_capacity(raws.len());
-        for (&num, e) in &raws {
+        // `order` is leaves-first, so reverse it to establish each directory
+        // from its already-cached parent path in one string allocation.
+        for &num in order.iter().rev() {
+            let e = &raws[&num];
+            if !e.is_dir {
+                continue;
+            }
+            let path = if num == 5 {
+                root.clone()
+            } else {
+                let parent = memo
+                    .get(&e.parent)
+                    .map(AsRef::as_ref)
+                    .unwrap_or(root_path.as_ref());
+                let mut path = String::with_capacity(parent.len() + e.name.len() + 1);
+                path.push_str(parent);
+                if !path.ends_with('\\') {
+                    path.push('\\');
+                }
+                path.push_str(&e.name);
+                path
+            };
+            memo.insert(num, Arc::from(path.as_str()));
             let (size, alloc) = if e.is_dir {
                 (
                     total_size.get(&num).copied().unwrap_or(e.size),
@@ -514,11 +702,49 @@ mod imp {
                 (e.size, e.alloc)
             };
             out.push(FileEntry {
-                path: path_of(num, &raws, drive, &mut memo),
+                path: EntryPath::ready(path),
                 size,
                 alloc,
                 modified: e.modified,
                 is_dir: e.is_dir,
+                file_count: total_files.get(&num).copied().unwrap_or(0),
+                folder_count: total_folders.get(&num).copied().unwrap_or(0),
+            });
+        }
+        for &num in order.iter().rev() {
+            let entry = &raws[&num];
+            if entry.is_dir {
+                continue;
+            }
+            out.push(FileEntry {
+                path: EntryPath::lazy(
+                    memo.get(&entry.parent)
+                        .cloned()
+                        .unwrap_or_else(|| root_path.clone()),
+                    entry.name.clone(),
+                ),
+                size: entry.size,
+                alloc: entry.alloc,
+                modified: entry.modified,
+                is_dir: false,
+                file_count: 0,
+                folder_count: 0,
+            });
+        }
+        // Some damaged or unusual volumes omit a parseable root record. The
+        // UI still needs a stable root to attach its direct child folders.
+        if !out
+            .iter()
+            .any(|entry| entry.is_dir && entry.path.as_str() == root)
+        {
+            out.push(FileEntry {
+                path: EntryPath::ready(root),
+                size: total_size.get(&5).copied().unwrap_or(0),
+                alloc: total_alloc.get(&5).copied().unwrap_or(0),
+                modified: 0,
+                is_dir: true,
+                file_count: total_files.get(&5).copied().unwrap_or(0),
+                folder_count: total_folders.get(&5).copied().unwrap_or(0),
             });
         }
         Ok(out)
@@ -531,7 +757,7 @@ mod imp {
 
 #[cfg(not(windows))]
 mod imp {
-    use super::FileEntry;
+    use super::{EntryPath, FileEntry, ScanPhase};
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -554,7 +780,11 @@ mod imp {
         ))
     }
 
-    pub fn scan(drive: &str, progress: &dyn Fn(u64) -> bool) -> Result<Vec<FileEntry>, String> {
+    pub fn scan(
+        drive: &str,
+        progress: &dyn Fn(u64) -> bool,
+        phase: &dyn Fn(ScanPhase),
+    ) -> Result<Vec<FileEntry>, String> {
         use std::os::unix::fs::MetadataExt;
         use std::time::UNIX_EPOCH;
 
@@ -562,10 +792,12 @@ mod imp {
         let mut files: Vec<(PathBuf, u64, u64, u64)> = Vec::new();
         let mut stack = vec![PathBuf::from(drive)];
         let mut count = 0u64;
-        // every visited dir, so empty folders still show up in the tree
-        let mut dir_agg: HashMap<PathBuf, (u64, u64)> = HashMap::new();
+        phase(ScanPhase::ReadingRecords);
+        // every visited dir, so empty folders still show up in the tree.
+        // Tuple: (size, alloc, recursive file count, recursive folder count).
+        let mut dir_agg: HashMap<PathBuf, (u64, u64, u64, u64)> = HashMap::new();
         while let Some(dir) = stack.pop() {
-            dir_agg.entry(dir.clone()).or_insert((0, 0));
+            dir_agg.entry(dir.clone()).or_insert((0, 0, 0, 0));
             let rd = match std::fs::read_dir(&dir) {
                 Ok(rd) => rd,
                 Err(_) => continue,
@@ -577,6 +809,15 @@ mod imp {
                     Err(_) => continue,
                 };
                 if md.is_dir() {
+                    // immediate parent gets +1 folder now; the subdirectory's
+                    // own descendant counts fold in during bottom-up propagation.
+                    if let Some(parent) = p.parent() {
+                        if let Some(e) = dir_agg.get_mut(parent) {
+                            e.3 += 1;
+                        } else {
+                            dir_agg.insert(parent.to_path_buf(), (0, 0, 0, 1));
+                        }
+                    }
                     stack.push(p);
                 } else {
                     count += 1;
@@ -599,8 +840,9 @@ mod imp {
                         if let Some(e) = dir_agg.get_mut(parent) {
                             e.0 += size;
                             e.1 += alloc;
+                            e.2 += 1;
                         } else {
-                            dir_agg.insert(parent.to_path_buf(), (size, alloc));
+                            dir_agg.insert(parent.to_path_buf(), (size, alloc, 1, 0));
                         }
                     }
                 }
@@ -608,15 +850,18 @@ mod imp {
         }
         // Propagate directory totals bottom-up: deepest dirs first, so when a
         // dir is processed all of its children have already been folded in.
+        phase(ScanPhase::AggregatingFolders);
         let mut dirs: Vec<PathBuf> = dir_agg.keys().cloned().collect();
         dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
         for d in &dirs {
             if let Some(parent) = d.parent() {
-                let (s, a) = dir_agg[d];
-                if s != 0 || a != 0 {
+                let (s, a, fc, dc) = dir_agg[d];
+                if s != 0 || a != 0 || fc != 0 || dc != 0 {
                     if let Some(e) = dir_agg.get_mut(parent) {
                         e.0 += s;
                         e.1 += a;
+                        e.2 += fc;
+                        e.3 += dc;
                     }
                 }
             }
@@ -624,14 +869,17 @@ mod imp {
         let mut out: Vec<FileEntry> = files
             .into_iter()
             .map(|(p, s, a, m)| FileEntry {
-                path: p.to_string_lossy().into_owned(),
+                path: EntryPath::ready(p.to_string_lossy().into_owned()),
                 size: s,
                 alloc: a,
                 modified: m,
                 is_dir: false,
+                file_count: 0,
+                folder_count: 0,
             })
             .collect();
-        for (p, (s, a)) in dir_agg {
+        phase(ScanPhase::BuildingPaths);
+        for (p, (s, a, fc, dc)) in dir_agg {
             let modified = std::fs::metadata(&p)
                 .ok()
                 .and_then(|md| md.modified().ok())
@@ -639,11 +887,13 @@ mod imp {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             out.push(FileEntry {
-                path: p.to_string_lossy().into_owned(),
+                path: EntryPath::ready(p.to_string_lossy().into_owned()),
                 size: s,
                 alloc: a,
                 modified,
                 is_dir: true,
+                file_count: fc,
+                folder_count: dc,
             });
         }
         progress(count);

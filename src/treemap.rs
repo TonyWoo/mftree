@@ -66,22 +66,10 @@ pub fn squarify(weights: &[f64], x: f64, y: f64, w: f64, h: f64) -> Vec<TreemapR
             return;
         }
         if *cw >= *ch {
-            // row along the top, full width slice of height s / cw
-            let rh = s / *cw;
-            let mut rx = *cx;
-            for &(i, a) in row {
-                let rw = a / rh;
-                rects[i] = TreemapRect {
-                    x: rx,
-                    y: *cy,
-                    w: rw,
-                    h: rh,
-                };
-                rx += rw;
-            }
-            *cy += rh;
-            *ch -= rh;
-        } else {
+            // wide remaining area: slice off a column fixed to the full
+            // height and stack the row's items vertically inside it —
+            // slicing a horizontal strip here instead degenerates into
+            // full-width bars on wide/short containers.
             let rw = s / *ch;
             let mut ry = *cy;
             for &(i, a) in row {
@@ -96,6 +84,23 @@ pub fn squarify(weights: &[f64], x: f64, y: f64, w: f64, h: f64) -> Vec<TreemapR
             }
             *cx += rw;
             *cw -= rw;
+        } else {
+            // tall remaining area: slice off a row fixed to the full width
+            // and lay the row's items side by side inside it.
+            let rh = s / *cw;
+            let mut rx = *cx;
+            for &(i, a) in row {
+                let rw = a / rh;
+                rects[i] = TreemapRect {
+                    x: rx,
+                    y: *cy,
+                    w: rw,
+                    h: rh,
+                };
+                rx += rw;
+            }
+            *cy += rh;
+            *ch -= rh;
         }
     }
 

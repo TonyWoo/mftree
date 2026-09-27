@@ -20,24 +20,54 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Instant;
 
-#[derive(Clone)]
-struct Item {
-    path: String,
-    size: u64,
-    alloc: u64,
-    modified: u64, // unix seconds, 0 = unknown
-    is_dir: bool,
+type Item = mft::FileEntry;
+
+trait ItemExt {
+    fn path(&self) -> &str;
+    fn name(&self) -> &str;
+    fn parent(&self) -> Option<&str>;
+}
+
+impl ItemExt for mft::FileEntry {
+    fn path(&self) -> &str {
+        self.path.as_str()
+    }
+
+    fn name(&self) -> &str {
+        self.path.name()
+    }
+
+    fn parent(&self) -> Option<&str> {
+        self.path.parent()
+    }
 }
 
 enum ScanMsg {
     Progress(u64),
-    Done(Result<Vec<Item>, String>),
+    Phase(mft::ScanPhase),
+    Done(Result<ScanResult, String>),
+}
+
+struct ScanResult {
+    files: Vec<Item>,
+    dirs: Vec<Item>,
+    total_size: u64,
+    ext_stats: Vec<ExtStat>,
 }
 
 #[derive(PartialEq, Clone, Copy)]
 enum ListTab {
     Files,
     Folders,
+}
+
+/// One child of a treemap level: a subfolder (recurses further) or a plain
+/// file (always a flat leaf tile) — mixed together the way WizTree lays out
+/// a folder's contents.
+#[derive(Clone, Copy)]
+enum TreemapItem {
+    Dir(usize),
+    File(usize),
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -376,6 +406,9 @@ struct App {
     /// parent path -> child dir indices (size-desc); rebuilt on data change.
     dir_children: HashMap<String, Vec<usize>>,
     dir_index_version: u64,
+    /// parent path -> direct child file indices; rebuilt on data change.
+    dir_files: HashMap<String, Vec<usize>>,
+    dir_files_version: u64,
     /// UI language (toggle in the top bar).
     lang: Lang,
     /// Folder tree: scroll the selected row into view (one-shot).
@@ -389,15 +422,22 @@ struct App {
     ext_sort_col: ExtSortCol,
     ext_sort_asc: bool,
     sel_ext: Option<String>,
-    /// dir path -> (recursive file count, recursive subfolder count).
-    dir_counts: HashMap<String, (u64, u64)>,
-    dir_counts_version: u64,
     /// top-level treemap folder -> dominant extension (for ext coloring).
     top_ext: HashMap<String, String>,
-    top_ext_version: u64,
+    top_ext_key: Option<(u64, String)>,
 }
 
 impl App {
+    /// Per-level tile cap derived from drawable area.
+    ///
+    /// Too many siblings in a very wide region makes squarify degrade into
+    /// long strips; this keeps density proportional to pixels.
+    fn tiles_limit_for_area(&self, w: f64, h: f64, min_cap: usize, max_cap: usize) -> usize {
+        let area = (w.max(1.0) * h.max(1.0)) as f32;
+        let raw = (area / 2600.0) as usize;
+        raw.clamp(min_cap, max_cap)
+    }
+
     fn new() -> Self {
         let drives = mft::list_drives();
         let drive = drives.first().cloned().unwrap_or_default();
@@ -432,6 +472,8 @@ impl App {
             expanded: HashSet::new(),
             dir_children: HashMap::new(),
             dir_index_version: u64::MAX,
+            dir_files: HashMap::new(),
+            dir_files_version: u64::MAX,
             lang: Lang::Zh,
             tree_scroll_to_sel: false,
             tree_sort_col: TreeSortCol::Size,
@@ -441,10 +483,8 @@ impl App {
             ext_sort_col: ExtSortCol::Size,
             ext_sort_asc: false,
             sel_ext: None,
-            dir_counts: HashMap::new(),
-            dir_counts_version: u64::MAX,
             top_ext: HashMap::new(),
-            top_ext_version: u64::MAX,
+            top_ext_key: None,
         };
         app.refresh_disk_space();
         app
@@ -485,20 +525,55 @@ impl App {
         let drive = self.drive.clone();
         self.status = i18n::scanning(self.lang, &drive);
         std::thread::spawn(move || {
-            let r = mft::scan(&drive, &|n| {
-                let _ = tx.send(ScanMsg::Progress(n));
-                !cancel.load(Ordering::Relaxed)
-            });
-            let items = r.map(|v| {
-                v.into_iter()
-                    .map(|e| Item {
-                        path: e.path,
-                        size: e.size,
-                        alloc: e.alloc,
-                        modified: e.modified,
-                        is_dir: e.is_dir,
+            let r = mft::scan(
+                &drive,
+                &|n| {
+                    let _ = tx.send(ScanMsg::Progress(n));
+                    !cancel.load(Ordering::Relaxed)
+                },
+                &|phase| {
+                    let _ = tx.send(ScanMsg::Phase(phase));
+                },
+            );
+            let items = r.map(|mut files| {
+                let _ = tx.send(ScanMsg::Phase(mft::ScanPhase::PreparingResults));
+                let mut dirs = Vec::new();
+                let mut total_size = 0u64;
+                let mut index = 0;
+                while index < files.len() {
+                    if files[index].is_dir {
+                        dirs.push(files.swap_remove(index));
+                    } else {
+                        total_size += files[index].size;
+                        index += 1;
+                    }
+                }
+                // File and folder ordering is selected only for the visible
+                // view; sorting every directory delays large scans needlessly.
+                // Extension stats are root-independent, so compute them once
+                // here instead of on the UI thread's first post-scan frame.
+                let mut ext_map: HashMap<String, (u64, u64, u64)> = HashMap::new();
+                for f in &files {
+                    let v = ext_map.entry(ext_of(f.name())).or_insert((0, 0, 0));
+                    v.0 += f.size;
+                    v.1 += f.alloc;
+                    v.2 += 1;
+                }
+                let ext_stats = ext_map
+                    .into_iter()
+                    .map(|(ext, (size, alloc, count))| ExtStat {
+                        ext,
+                        size,
+                        alloc,
+                        count,
                     })
-                    .collect::<Vec<_>>()
+                    .collect();
+                ScanResult {
+                    files,
+                    dirs,
+                    total_size,
+                    ext_stats,
+                }
             });
             let _ = tx.send(ScanMsg::Done(items));
         });
@@ -510,6 +585,7 @@ impl App {
             while let Ok(m) = rx.try_recv() {
                 match m {
                     ScanMsg::Progress(n) => self.progress = n,
+                    ScanMsg::Phase(phase) => self.status = i18n::scan_phase(self.lang, phase),
                     ScanMsg::Done(r) => {
                         done = Some(r);
                         break;
@@ -527,12 +603,13 @@ impl App {
                 .map(|t| t.elapsed().as_secs_f64())
                 .unwrap_or(0.0);
             match r {
-                Ok(mut items) => {
-                    items.sort_by_key(|a| std::cmp::Reverse(a.size));
-                    self.total_size = items.iter().filter(|i| !i.is_dir).map(|i| i.size).sum();
-                    self.dirs = items.iter().filter(|i| i.is_dir).cloned().collect();
-                    self.files = items.into_iter().filter(|i| !i.is_dir).collect();
+                Ok(result) => {
+                    self.total_size = result.total_size;
+                    self.dirs = result.dirs;
+                    self.files = result.files;
                     self.data_version += 1;
+                    self.ext_stats = result.ext_stats;
+                    self.ext_version = self.data_version;
                     let nf = self.files.len();
                     let nd = self.dirs.len();
                     self.status = i18n::done_status(
@@ -575,18 +652,58 @@ impl App {
             .iter()
             .enumerate()
             .filter(|(_, it)| {
-                (q.is_empty() || it.path.to_lowercase().contains(&q))
-                    && root.map(|r| path_under(&it.path, r)).unwrap_or(true)
+                (q.is_empty() || it.path().to_lowercase().contains(&q))
+                    && root
+                        .map(|r| {
+                            it.parent()
+                                .map(|parent| parent == r || path_under(parent, r))
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(true)
             })
             .collect();
         let total = rows.len();
+        const DISPLAY_LIMIT: usize = 2000;
+        if rows.len() > DISPLAY_LIMIT {
+            match col {
+                SortCol::Size | SortCol::Pct => {
+                    if asc {
+                        rows.select_nth_unstable_by_key(DISPLAY_LIMIT, |(_, item)| item.size);
+                    } else {
+                        rows.select_nth_unstable_by_key(DISPLAY_LIMIT, |(_, item)| {
+                            std::cmp::Reverse(item.size)
+                        });
+                    }
+                    rows.truncate(DISPLAY_LIMIT);
+                }
+                SortCol::Alloc => {
+                    if asc {
+                        rows.select_nth_unstable_by_key(DISPLAY_LIMIT, |(_, item)| item.alloc);
+                    } else {
+                        rows.select_nth_unstable_by_key(DISPLAY_LIMIT, |(_, item)| {
+                            std::cmp::Reverse(item.alloc)
+                        });
+                    }
+                    rows.truncate(DISPLAY_LIMIT);
+                }
+                SortCol::Modified => {
+                    if asc {
+                        rows.select_nth_unstable_by_key(DISPLAY_LIMIT, |(_, item)| item.modified);
+                    } else {
+                        rows.select_nth_unstable_by_key(DISPLAY_LIMIT, |(_, item)| {
+                            std::cmp::Reverse(item.modified)
+                        });
+                    }
+                    rows.truncate(DISPLAY_LIMIT);
+                }
+                // Name sort is explicit user intent and needs a full lexical
+                // order, so retain its existing behavior.
+                SortCol::Name => {}
+            }
+        }
         match col {
             SortCol::Name => {
-                rows.sort_by(|a, b| {
-                    short_name(&a.1.path)
-                        .to_lowercase()
-                        .cmp(&short_name(&b.1.path).to_lowercase())
-                });
+                rows.sort_by(|a, b| a.1.name().to_lowercase().cmp(&b.1.name().to_lowercase()));
             }
             SortCol::Size | SortCol::Pct => rows.sort_by_key(|(_, it)| it.size),
             SortCol::Alloc => rows.sort_by_key(|(_, it)| it.alloc),
@@ -595,7 +712,7 @@ impl App {
         if !asc {
             rows.reverse();
         }
-        rows.truncate(2000);
+        rows.truncate(DISPLAY_LIMIT);
         (rows, total)
     }
 
@@ -605,15 +722,15 @@ impl App {
         let mut freed = 0u64;
         if is_dir {
             self.files.retain(|i| {
-                let gone = i.path == path || path_under(&i.path, path);
+                let gone = i.path() == path || path_under(i.path(), path);
                 if gone {
                     freed += i.size;
                 }
                 !gone
             });
             self.dirs
-                .retain(|i| !(i.path == path || path_under(&i.path, path)));
-        } else if let Some(pos) = self.files.iter().position(|i| i.path == path) {
+                .retain(|i| !(i.path() == path || path_under(i.path(), path)));
+        } else if let Some(pos) = self.files.iter().position(|i| i.path() == path) {
             freed = self.files[pos].size;
             self.files.remove(pos);
         }
@@ -662,7 +779,7 @@ impl App {
         let mut n = 0usize;
         for it in items {
             if let Some(r) = &root {
-                if !path_under(&it.path, r) {
+                if !path_under(it.path(), r) {
                     continue;
                 }
             }
@@ -674,7 +791,7 @@ impl App {
             };
             out.push_str(&format!(
                 "\"{}\",{},{},{},{},{:.1}%,{},{}\n",
-                it.path.replace('"', "\"\""),
+                it.path().replace('"', "\"\""),
                 it.size,
                 it.alloc,
                 human(it.size).trim(),
@@ -871,7 +988,7 @@ impl App {
                     let it = &self.files[idx];
                     let sel = self.selected == Some((ListTab::Files, idx));
                     row.col(|ui| {
-                        let label = short_name(&it.path);
+                        let label = it.name();
                         let resp = ui.selectable_label(sel, label);
                         if resp.clicked() {
                             self.selected = Some((ListTab::Files, idx));
@@ -879,7 +996,7 @@ impl App {
                         if sel && self.scroll_to_sel {
                             ui.scroll_to_rect(resp.rect, Some(egui::Align::Center));
                         }
-                        let path = it.path.clone();
+                        let path = it.path().to_string();
                         let size = it.size;
                         let mut action = None;
                         resp.context_menu(|ui| {
@@ -950,7 +1067,6 @@ impl App {
             return;
         }
         self.ensure_dir_index();
-        self.ensure_dir_counts();
         self.draw_breadcrumb(ui);
 
         // Flatten the visible (expanded) rows. WizTree-style: the drive root
@@ -1074,38 +1190,38 @@ impl App {
                 body.rows(20.0, nrows, |mut row| {
                     let r = &rows[row.index()];
                     let d = &self.dirs[r.idx];
-                    let (fc, dc) = self.dir_counts.get(&d.path).copied().unwrap_or((0, 0));
+                    let (fc, dc) = (d.file_count, d.folder_count);
                     let sel = self.selected == Some((ListTab::Folders, r.idx));
                     row.col(|ui| {
                         ui.add_space(r.indent as f32 * 14.0);
                         let has_kids = self
                             .dir_children
-                            .get(&d.path)
+                            .get(d.path())
                             .map(|v| !v.is_empty())
                             .unwrap_or(false);
-                        let is_exp = self.expanded.contains(&d.path);
+                        let is_exp = self.expanded.contains(d.path());
                         if has_kids {
                             if ui.small_button(if is_exp { "▼" } else { "▶" }).clicked() {
                                 if is_exp {
-                                    self.expanded.remove(&d.path);
+                                    self.expanded.remove(d.path());
                                 } else {
-                                    self.expanded.insert(d.path.clone());
+                                    self.expanded.insert(d.path().to_string());
                                 }
                             }
                         } else {
                             ui.add_space(18.0);
                         }
-                        let resp = ui.selectable_label(sel, short_name(&d.path));
+                        let resp = ui.selectable_label(sel, d.name());
                         if resp.clicked() {
                             self.selected = Some((ListTab::Folders, r.idx));
                         }
                         if resp.double_clicked() {
-                            drill = Some((d.path.clone(), r.idx));
+                            drill = Some((d.path().to_string(), r.idx));
                         }
                         if sel && self.tree_scroll_to_sel {
                             ui.scroll_to_rect(resp.rect, Some(egui::Align::Center));
                         }
-                        let path = d.path.clone();
+                        let path = d.path().to_string();
                         let size = d.size;
                         let mut action = None;
                         resp.context_menu(|ui| {
@@ -1198,34 +1314,14 @@ impl App {
         kids.sort_by(|&a, &b| {
             let (da, db) = (&self.dirs[a], &self.dirs[b]);
             let ord = match col {
-                TreeSortCol::Name => short_name(&da.path)
-                    .to_lowercase()
-                    .cmp(&short_name(&db.path).to_lowercase()),
+                TreeSortCol::Name => da.name().to_lowercase().cmp(&db.name().to_lowercase()),
                 TreeSortCol::Size | TreeSortCol::Pct => da.size.cmp(&db.size),
                 TreeSortCol::Alloc => da.alloc.cmp(&db.alloc),
                 TreeSortCol::Items => {
-                    let ka = self
-                        .dir_counts
-                        .get(&da.path)
-                        .map(|(f, d)| f + d)
-                        .unwrap_or(0);
-                    let kb = self
-                        .dir_counts
-                        .get(&db.path)
-                        .map(|(f, d)| f + d)
-                        .unwrap_or(0);
-                    ka.cmp(&kb)
+                    (da.file_count + da.folder_count).cmp(&(db.file_count + db.folder_count))
                 }
-                TreeSortCol::Files => {
-                    let ka = self.dir_counts.get(&da.path).map(|c| c.0).unwrap_or(0);
-                    let kb = self.dir_counts.get(&db.path).map(|c| c.0).unwrap_or(0);
-                    ka.cmp(&kb)
-                }
-                TreeSortCol::Folders => {
-                    let ka = self.dir_counts.get(&da.path).map(|c| c.1).unwrap_or(0);
-                    let kb = self.dir_counts.get(&db.path).map(|c| c.1).unwrap_or(0);
-                    ka.cmp(&kb)
-                }
+                TreeSortCol::Files => da.file_count.cmp(&db.file_count),
+                TreeSortCol::Folders => da.folder_count.cmp(&db.folder_count),
                 TreeSortCol::Modified => da.modified.cmp(&db.modified),
             };
             if asc {
@@ -1241,8 +1337,8 @@ impl App {
                 indent,
                 parent_size,
             });
-            if self.expanded.contains(&d.path) {
-                self.collect_tree_rows(&d.path, indent + 1, d.size, rows);
+            if self.expanded.contains(d.path()) {
+                self.collect_tree_rows(d.path(), indent + 1, d.size, rows);
             }
         }
     }
@@ -1424,8 +1520,8 @@ impl App {
         }
         let mut map: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, d) in self.dirs.iter().enumerate() {
-            let p = parent_dir(&d.path);
-            if p == d.path {
+            let p = parent_dir(d.path());
+            if p == d.path() {
                 continue; // drive root is its own parent; skip
             }
             map.entry(p.to_string()).or_default().push(i);
@@ -1433,6 +1529,40 @@ impl App {
         // self.dirs is size-desc from the scan, so each child list is too.
         self.dir_children = map;
         self.dir_index_version = self.data_version;
+    }
+
+    /// Rebuild the parent -> direct child file index when scan data changed.
+    /// Lets subtree queries (treemap grouping) skip files outside the
+    /// requested folder instead of scanning every file on the drive.
+    fn ensure_dir_files(&mut self) {
+        if self.dir_files_version == self.data_version {
+            return;
+        }
+        let mut map: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, f) in self.files.iter().enumerate() {
+            let Some(p) = f.parent() else { continue };
+            if let Some(v) = map.get_mut(p) {
+                v.push(i);
+            } else {
+                map.insert(p.to_string(), vec![i]);
+            }
+        }
+        self.dir_files = map;
+        self.dir_files_version = self.data_version;
+    }
+
+    /// File indices anywhere under `root`, found via `dir_children`/`dir_files`
+    /// instead of scanning the full file list.
+    fn collect_files_under(&self, root: &str, out: &mut Vec<usize>) {
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            if let Some(files) = self.dir_files.get(dir) {
+                out.extend_from_slice(files);
+            }
+            if let Some(children) = self.dir_children.get(dir) {
+                stack.extend(children.iter().map(|&idx| self.dirs[idx].path()));
+            }
+        }
     }
 
     /// Current view root as a plain path ("C:" at drive root).
@@ -1457,7 +1587,7 @@ impl App {
 
     /// Linear index lookup of a folder path in `self.dirs` (size-desc).
     fn dir_idx(&self, path: &str) -> Option<usize> {
-        self.dirs.iter().position(|d| d.path == path)
+        self.dirs.iter().position(|d| d.path() == path)
     }
 
     /// Sync the folder tree to `path`: expand the ancestor chain, select the
@@ -1490,50 +1620,6 @@ impl App {
         self.sync_tree_to(&path, idx);
     }
 
-    /// (files, subfolders) counts per dir, recursive; rebuilt per scan.
-    fn ensure_dir_counts(&mut self) {
-        if self.dir_counts_version == self.data_version {
-            return;
-        }
-        let mut counts: HashMap<String, (u64, u64)> = HashMap::new();
-        let root = self.drive_root();
-        for f in &self.files {
-            let mut p = parent_dir(&f.path).to_string();
-            loop {
-                let e = counts.entry(p.clone()).or_insert((0, 0));
-                e.0 += 1;
-                if p == root {
-                    break;
-                }
-                let up = parent_dir(&p).to_string();
-                if up == p {
-                    break;
-                }
-                p = up;
-            }
-        }
-        for d in &self.dirs {
-            if d.path == root {
-                continue;
-            }
-            let mut p = parent_dir(&d.path).to_string();
-            loop {
-                let e = counts.entry(p.clone()).or_insert((0, 0));
-                e.1 += 1;
-                if p == root {
-                    break;
-                }
-                let up = parent_dir(&p).to_string();
-                if up == p {
-                    break;
-                }
-                p = up;
-            }
-        }
-        self.dir_counts = counts;
-        self.dir_counts_version = self.data_version;
-    }
-
     /// Extension aggregates over all files; rebuilt per scan.
     fn ensure_ext_stats(&mut self) {
         if self.ext_version == self.data_version {
@@ -1541,7 +1627,7 @@ impl App {
         }
         let mut map: HashMap<String, (u64, u64, u64)> = HashMap::new();
         for f in &self.files {
-            let e = ext_of(&f.path);
+            let e = ext_of(f.name());
             let v = map.entry(e).or_insert((0, 0, 0));
             v.0 += f.size;
             v.1 += f.alloc;
@@ -1562,36 +1648,25 @@ impl App {
     /// Dominant (largest-size) extension per top-level treemap folder, so
     /// the treemap can share the extension stats panel's colors.
     fn ensure_top_ext(&mut self) {
-        if self.top_ext_version == self.data_version {
+        let root = self.treemap_root();
+        let key = (self.data_version, root.clone());
+        if self.top_ext_key.as_ref() == Some(&key) {
             return;
         }
-        let root = self.treemap_root();
+        self.ensure_dir_index();
+        self.ensure_dir_files();
+        let children = self.dir_children.get(&root).cloned().unwrap_or_default();
         let mut per_dir: HashMap<String, HashMap<String, u64>> = HashMap::new();
-        for f in &self.files {
-            if !path_under(&f.path, &root) {
-                continue;
+        let mut file_indices = Vec::new();
+        for child_idx in children {
+            let child_path = self.dirs[child_idx].path().to_string();
+            file_indices.clear();
+            self.collect_files_under(&child_path, &mut file_indices);
+            let bucket = per_dir.entry(child_path).or_default();
+            for &fi in &file_indices {
+                let f = &self.files[fi];
+                *bucket.entry(ext_of(f.name())).or_insert(0) += f.size;
             }
-            let rel = &f.path[root.len().min(f.path.len())..];
-            let rel = rel.trim_start_matches(['\\', '/']);
-            let top_seg = rel.split(['\\', '/']).next().unwrap_or("");
-            if top_seg.is_empty() {
-                continue;
-            }
-            let sep = if root.contains('\\') { '\\' } else { '/' };
-            let top = if root.ends_with(sep) {
-                format!("{root}{top_seg}")
-            } else {
-                format!("{root}{sep}{top_seg}")
-            };
-            // only folders (treemap shows folders); skip bare files at root
-            if self.dir_idx(&top).is_none() {
-                continue;
-            }
-            *per_dir
-                .entry(top)
-                .or_default()
-                .entry(ext_of(&f.path))
-                .or_insert(0) += f.size;
         }
         self.top_ext = per_dir
             .into_iter()
@@ -1601,14 +1676,51 @@ impl App {
                     .map(|(ext, _)| (dir, ext))
             })
             .collect();
-        self.top_ext_version = self.data_version;
+        self.top_ext_key = Some(key);
     }
 
-    /// Nested treemap of folders: child folders of the current view root,
-    /// sized by total size, with subfolders nested inside (up to 3 levels).
-    /// Color encodes size (blue -> yellow -> red). Click drills in;
-    /// right-click opens the folder menu.
+    fn item_size(&self, item: TreemapItem) -> u64 {
+        match item {
+            TreemapItem::Dir(idx) => self.dirs[idx].size,
+            TreemapItem::File(idx) => self.files[idx].size,
+        }
+    }
+
+    /// Subfolders and direct files under `path`, combined for one treemap
+    /// level via the precomputed `dir_children`/`dir_files` indices.
+    fn treemap_children(&self, path: &str) -> Vec<TreemapItem> {
+        let mut items: Vec<TreemapItem> = self
+            .dir_children
+            .get(path)
+            .map(|v| v.iter().map(|&i| TreemapItem::Dir(i)).collect())
+            .unwrap_or_default();
+        if let Some(files) = self.dir_files.get(path) {
+            items.extend(files.iter().map(|&i| TreemapItem::File(i)));
+        }
+        items
+    }
+
+    /// Keep only the largest `limit` items, size-descending (squarify wants
+    /// descending weights for a balanced layout).
+    fn largest_items(&self, mut items: Vec<TreemapItem>, limit: usize) -> Vec<TreemapItem> {
+        if items.len() > limit {
+            items
+                .select_nth_unstable_by_key(limit, |&item| std::cmp::Reverse(self.item_size(item)));
+            items.truncate(limit);
+        }
+        items.sort_unstable_by_key(|&item| std::cmp::Reverse(self.item_size(item)));
+        items
+    }
+
+    /// Nested treemap of the current view root's contents: subfolders and
+    /// their direct files together, with subfolders nested further inside
+    /// (up to 4 levels). Color encodes size (blue -> yellow -> red). Click
+    /// drills into folders and selects files; right-click opens the menu.
     fn draw_treemap(&mut self, ui: &mut egui::Ui) {
+        // Claim the full panel size up front. Otherwise the panel's stored
+        // height shrinks to whatever this content actually draws, which
+        // undoes an upward drag the moment you release it.
+        ui.set_min_size(ui.available_size());
         if self.dirs.is_empty() {
             ui.centered_and_justified(|ui| {
                 ui.label(tr(self.lang, S::NoData));
@@ -1616,21 +1728,22 @@ impl App {
             return;
         }
         self.ensure_dir_index();
+        self.ensure_dir_files();
         self.ensure_top_ext();
         let root = self.treemap_root();
-        let top: Vec<usize> = self
-            .dir_children
-            .get(&root)
-            .map(|v| v.iter().take(200).copied().collect())
-            .unwrap_or_default();
+        let avail = ui.available_size();
+        let tm_h = (avail.y - 34.0).max(60.0);
+        // Use the whole panel width, as WizTree does. The area-based tile cap
+        // below keeps a wide panel from becoming excessively dense.
+        let layout_w = avail.x.max(120.0);
+        let top_cap = self.tiles_limit_for_area(layout_w as f64, tm_h as f64, 40, 140);
+        let top = self.largest_items(self.treemap_children(&root), top_cap);
         if top.is_empty() {
             ui.centered_and_justified(|ui| {
                 ui.label(tr(self.lang, S::NoSubfolders));
             });
             return;
         }
-        let avail = ui.available_size();
-        let tm_h = (avail.y - 34.0).max(60.0);
         let (resp, painter) = ui.allocate_painter(egui::vec2(avail.x, tm_h), egui::Sense::hover());
         let origin = resp.rect.min;
         let painter = painter.clone();
@@ -1643,7 +1756,7 @@ impl App {
             &top,
             0.0,
             0.0,
-            avail.x as f64,
+            layout_w as f64,
             tm_h as f64,
             0,
             &mut menu_hit,
@@ -1662,7 +1775,7 @@ impl App {
             }
         }
 
-        // how many folders are shown in the treemap
+        // how many items are shown in the treemap
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label(
@@ -1682,7 +1795,7 @@ impl App {
         ui: &mut egui::Ui,
         painter: &egui::Painter,
         origin: egui::Pos2,
-        indices: &[usize],
+        items: &[TreemapItem],
         x: f64,
         y: f64,
         w: f64,
@@ -1691,10 +1804,10 @@ impl App {
         menu_hit: &mut Option<(MenuAction, String, u64, bool)>,
         drill: &mut Option<(String, usize)>,
     ) {
-        if indices.is_empty() || w < 4.0 || h < 4.0 {
+        if items.is_empty() || w < 4.0 || h < 4.0 {
             return;
         }
-        let weights: Vec<f64> = indices.iter().map(|&i| self.dirs[i].size as f64).collect();
+        let weights: Vec<f64> = items.iter().map(|&it| self.item_size(it) as f64).collect();
         let rects = treemap::squarify(&weights, x, y, w, h);
         let font_big = egui::FontId::proportional(12.0);
         let font_small = egui::FontId::proportional(11.0);
@@ -1703,16 +1816,28 @@ impl App {
             if r.w < 2.0 || r.h < 2.0 {
                 continue;
             }
-            let idx = indices[k];
-            let (path, size) = {
-                let d = &self.dirs[idx];
-                (d.path.clone(), d.size)
+            let item = items[k];
+            let is_dir = matches!(item, TreemapItem::Dir(_));
+            let idx = match item {
+                TreemapItem::Dir(idx) | TreemapItem::File(idx) => idx,
+            };
+            let (path, size) = match item {
+                TreemapItem::Dir(idx) => {
+                    let d = &self.dirs[idx];
+                    (d.path().to_string(), d.size)
+                }
+                TreemapItem::File(idx) => {
+                    let f = &self.files[idx];
+                    (f.path().to_string(), f.size)
+                }
             };
             let er = egui::Rect::from_min_size(
                 egui::pos2(origin.x + r.x as f32 + 1.0, origin.y + r.y as f32 + 1.0),
                 egui::vec2(r.w as f32 - 2.0, r.h as f32 - 2.0),
             );
-            let col = if depth == 0 {
+            let col = if !is_dir {
+                ext_color(short_name(&path))
+            } else if depth == 0 {
                 self.top_ext
                     .get(&path)
                     .map(|e| ext_color(e))
@@ -1720,9 +1845,14 @@ impl App {
             } else {
                 folder_color(k, depth)
             };
-            let id = ui.id().with(("tm", depth, idx));
+            let list_tab = if is_dir {
+                ListTab::Folders
+            } else {
+                ListTab::Files
+            };
+            let id = ui.id().with(("tm", depth, is_dir, idx));
             let rr = ui.interact(er, id, egui::Sense::click());
-            let hot = rr.hovered() || self.selected == Some((ListTab::Folders, idx));
+            let hot = rr.hovered() || self.selected == Some((list_tab, idx));
             painter.rect_filled(er, 3.0, col);
             if hot {
                 painter.rect_stroke(
@@ -1733,7 +1863,11 @@ impl App {
                 );
             }
             if rr.clicked() {
-                *drill = Some((path.clone(), idx));
+                if is_dir {
+                    *drill = Some((path.clone(), idx));
+                } else {
+                    self.selected = Some((ListTab::Files, idx));
+                }
             }
             let mut action = None;
             rr.context_menu(|ui| {
@@ -1758,13 +1892,13 @@ impl App {
                 }
             });
             if let Some(a) = action {
-                *menu_hit = Some((a, path.clone(), size, true));
+                *menu_hit = Some((a, path.clone(), size, is_dir));
             }
             rr.on_hover_text(format!("{}\n{}", path, human(size)));
             // Labels for large-enough rects; nested children go below the label.
             // Names are truncated by measured width so they show as completely
             // as possible; the full path is always in the hover tooltip.
-            let label_h = if r.w > 96.0 && r.h > 44.0 {
+            let label_h: f64 = if r.w > 96.0 && r.h > 44.0 {
                 let label = fit_label(painter, short_name(&path), &font_big, r.w as f32 - 14.0);
                 painter.text(
                     er.min + egui::vec2(6.0, 4.0),
@@ -1794,13 +1928,12 @@ impl App {
             } else {
                 0.0
             };
-            // Nested subfolders (up to 3 levels deep).
-            if depth < 2 && r.w > 120.0 && r.h > 90.0 {
-                let kids: Vec<usize> = self
-                    .dir_children
-                    .get(&path)
-                    .map(|v| v.iter().take(40).copied().collect())
-                    .unwrap_or_default();
+            // Folders nest their own contents (subfolders and files mixed,
+            // WizTree style); files are always leaves. No hard depth cap —
+            // the pixel-size gate below is what naturally stops recursion.
+            if is_dir && r.w > 90.0 && r.h > 60.0 {
+                let kids_cap = self.tiles_limit_for_area(r.w, r.h - label_h, 16, 96);
+                let kids = self.largest_items(self.treemap_children(&path), kids_cap);
                 if !kids.is_empty() {
                     let pad = 3.0;
                     self.draw_treemap_level(
@@ -1937,7 +2070,12 @@ impl eframe::App for App {
         // treemap docked above the status bar
         egui::Panel::bottom("treemap")
             .resizable(true)
-            .default_size(240.0)
+            .default_size(340.0)
+            // Old min (280) left only ~60px of shrink room before hitting the
+            // floor, making the divider feel stuck when dragged down; widen
+            // the range so both directions actually move.
+            .min_size(160.0)
+            .max_size(700.0)
             .show(ui, |ui| {
                 self.draw_treemap(ui);
             });
@@ -1947,7 +2085,12 @@ impl eframe::App for App {
                 egui::Panel::left("tree")
                     .resizable(true)
                     .default_size(600.0)
-                    .max_size(640.0)
+                    // Previous max (640) left almost no room to drag past the
+                    // default width, making the divider feel fixed; widen it
+                    // so it's actually usable while still leaving space for
+                    // the file-type panel on the right.
+                    .min_size(260.0)
+                    .max_size(1000.0)
                     .show(ui, |ui| {
                         self.draw_tree_view(ui);
                     });

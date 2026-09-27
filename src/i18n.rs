@@ -249,6 +249,26 @@ pub fn scanning(lang: Lang, drive: &str) -> String {
     }
 }
 
+/// Status for a scan stage after raw record enumeration.
+pub fn scan_phase(lang: Lang, phase: crate::mft::ScanPhase) -> String {
+    match (lang, phase) {
+        (Lang::Zh, crate::mft::ScanPhase::ReadingRecords) => "正在读取 MFT 记录…".to_string(),
+        (Lang::Zh, crate::mft::ScanPhase::IndexingFolders) => "正在建立文件夹索引…".to_string(),
+        (Lang::Zh, crate::mft::ScanPhase::AggregatingFolders) => "正在汇总文件夹大小…".to_string(),
+        (Lang::Zh, crate::mft::ScanPhase::BuildingPaths) => "正在生成文件路径…".to_string(),
+        (Lang::Zh, crate::mft::ScanPhase::PreparingResults) => "正在整理扫描结果…".to_string(),
+        (Lang::En, crate::mft::ScanPhase::ReadingRecords) => "Reading MFT records…".to_string(),
+        (Lang::En, crate::mft::ScanPhase::IndexingFolders) => "Building folder index…".to_string(),
+        (Lang::En, crate::mft::ScanPhase::AggregatingFolders) => {
+            "Calculating folder sizes…".to_string()
+        }
+        (Lang::En, crate::mft::ScanPhase::BuildingPaths) => "Building file paths…".to_string(),
+        (Lang::En, crate::mft::ScanPhase::PreparingResults) => {
+            "Preparing scan results…".to_string()
+        }
+    }
+}
+
 /// "Done: …" status after a scan.
 pub fn done_status(lang: Lang, nf: usize, nd: usize, size: &str, secs: f64) -> String {
     match lang {
