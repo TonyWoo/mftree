@@ -182,6 +182,16 @@ struct ConfirmDelete {
     is_dir: bool,
 }
 
+#[derive(PartialEq, Clone)]
+struct RowsKey {
+    tab: ListTab,
+    filter: String,
+    sort_col: SortCol,
+    sort_asc: bool,
+    view_root: Option<String>,
+    data_version: u64,
+}
+
 struct App {
     drives: Vec<String>,
     drive: String,
@@ -206,6 +216,13 @@ struct App {
     rx: Option<mpsc::Receiver<ScanMsg>>,
     cancel: Option<Arc<AtomicBool>>,
     started: Option<Instant>,
+    /// Cached filtered+sorted row indices into `files`/`dirs`; recomputed
+    /// only when `rows_key` inputs change (per-frame recompute over millions
+    /// of rows stalls resize/drag repaints).
+    rows_cache: Vec<usize>,
+    rows_total: usize,
+    rows_key: Option<RowsKey>,
+    data_version: u64,
 }
 
 impl App {
@@ -236,6 +253,10 @@ impl App {
             rx: None,
             cancel: None,
             started: None,
+            rows_cache: Vec::new(),
+            rows_total: 0,
+            rows_key: None,
+            data_version: 0,
         };
         app.refresh_disk_space();
         app
@@ -317,6 +338,7 @@ impl App {
                     self.total_size = items.iter().filter(|i| !i.is_dir).map(|i| i.size).sum();
                     self.dirs = items.iter().filter(|i| i.is_dir).cloned().collect();
                     self.files = items.into_iter().filter(|i| !i.is_dir).collect();
+                    self.data_version += 1;
                     let nf = self.files.len();
                     let nd = self.dirs.len();
                     self.status = format!(
@@ -397,6 +419,7 @@ impl App {
         }
         self.total_size = self.total_size.saturating_sub(freed);
         self.selected = None;
+        self.data_version += 1;
     }
 
     fn permanent_delete(&mut self) {
@@ -565,6 +588,28 @@ impl App {
         let mut asc = self.sort_asc;
         let root = self.view_root.clone();
         let scanning = self.scanning;
+        // Recompute the filtered+sorted rows only when the inputs changed;
+        // doing it every frame over millions of rows stalls resize repaints.
+        let key = RowsKey {
+            tab,
+            filter: self.filter.clone(),
+            sort_col: col,
+            sort_asc: asc,
+            view_root: root.clone(),
+            data_version: self.data_version,
+        };
+        if self.rows_key.as_ref() != Some(&key) {
+            let (rows, total) = {
+                let items: &[Item] = match tab {
+                    ListTab::Files => &self.files,
+                    ListTab::Folders => &self.dirs,
+                };
+                Self::filter_sort(items, &self.filter, col, asc, root.as_deref())
+            };
+            self.rows_cache = rows.into_iter().map(|(i, _)| i).collect();
+            self.rows_total = total;
+            self.rows_key = Some(key);
+        }
         let mut menu_hit: Option<(MenuAction, String, u64, bool)> = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
             egui::Grid::new("filelist")
@@ -576,20 +621,21 @@ impl App {
                     sort_header(ui, &mut col, &mut asc, SortCol::Size, "Size");
                     sort_header(ui, &mut col, &mut asc, SortCol::Pct, "%");
                     ui.end_row();
-                    let items: &[Item] = match tab {
-                        ListTab::Files => &self.files,
-                        ListTab::Folders => &self.dirs,
-                    };
                     let total_size = self.total_size;
-                    let (rows, total) =
-                        Self::filter_sort(items, &self.filter, col, asc, root.as_deref());
+                    let total = self.rows_total;
+                    let nrows = self.rows_cache.len();
                     let mut drill: Option<String> = None;
-                    for (idx, it) in &rows {
-                        let sel = self.selected == Some((tab, *idx));
+                    for k in 0..nrows {
+                        let idx = self.rows_cache[k];
+                        let it: &Item = match tab {
+                            ListTab::Files => &self.files[idx],
+                            ListTab::Folders => &self.dirs[idx],
+                        };
+                        let sel = self.selected == Some((tab, idx));
                         let label = short_name(&it.path).to_string();
                         let resp = ui.selectable_label(sel, label);
                         if resp.clicked() {
-                            self.selected = Some((tab, *idx));
+                            self.selected = Some((tab, idx));
                         }
                         if tab == ListTab::Folders && resp.double_clicked() {
                             drill = Some(it.path.clone());
@@ -634,7 +680,7 @@ impl App {
                     self.scroll_to_sel = false;
                     ui.end_row();
                     ui.label(
-                        egui::RichText::new(format!("{} of {total} shown", rows.len()))
+                        egui::RichText::new(format!("{nrows} of {total} shown"))
                             .small()
                             .weak(),
                     );
