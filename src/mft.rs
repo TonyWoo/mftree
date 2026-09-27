@@ -389,11 +389,23 @@ mod imp {
     }
 
     pub fn scan(drive: &str, progress: &dyn Fn(u64) -> bool) -> Result<Vec<FileEntry>, String> {
-        // Phase timing goes to stderr so a console run shows where time goes.
+        // Phase timing: on Windows release the app has no console
+        // (windows_subsystem), so log to a file as well as stderr.
+        fn scan_log(msg: &str) {
+            eprintln!("[sizetree] {msg}");
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(std::env::temp_dir().join("sizetree_scan.log"))
+            {
+                use std::io::Write;
+                let _ = writeln!(f, "[sizetree] {msg}");
+            }
+        }
         macro_rules! phase {
             ($t:ident, $name:expr) => {{
                 let d = $t.elapsed();
-                eprintln!("[sizetree] {}: {:.2}s", $name, d.as_secs_f64());
+                scan_log(&format!("{}: {:.2}s", $name, d.as_secs_f64()));
                 $t = std::time::Instant::now();
             }};
         }
@@ -405,11 +417,11 @@ mod imp {
         let raw0 = vol.read_at((mft_lcn as u64) * cluster, rec_size)?;
         let rec0 = apply_fixup(&raw0, bps).ok_or("MFT record 0 fixup failed")?;
         let runs = mft_runs(&rec0)?;
-        eprintln!(
-            "[sizetree] MFT runs: {}, total MiB: {}",
+        scan_log(&format!(
+            "MFT runs: {}, total MiB: {}",
             runs.len(),
             runs.iter().map(|(_, n)| n).sum::<u64>() * cluster / 1024 / 1024
-        );
+        ));
 
         let total_clusters: u64 = runs.iter().map(|(_, n)| n).sum();
         let mut mft =
@@ -432,7 +444,7 @@ mod imp {
             }
         }
         progress(nrec as u64);
-        eprintln!("[sizetree] parsed records: {}", raws.len());
+        scan_log(&format!("parsed records: {}", raws.len()));
         phase!(t, "parse records");
 
         // children index for directory aggregation
