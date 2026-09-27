@@ -1,4 +1,4 @@
-//! mftree — WizTree-style disk usage analyzer.
+//! sizetree — WizTree-style disk usage analyzer.
 //!
 //! Reads the NTFS $MFT directly on Windows; falls back to a directory walk
 //! elsewhere. Shows the largest files/folders plus a treemap.
@@ -596,7 +596,7 @@ impl App {
             .chars()
             .filter(|c| c.is_alphanumeric())
             .collect();
-        let fname = format!("mftree_{drive_tag}.csv");
+        let fname = format!("sizetree_{drive_tag}.csv");
         let dest = home_dir()
             .map(|h| format!("{h}/{fname}"))
             .unwrap_or(fname.clone());
@@ -1372,7 +1372,7 @@ impl eframe::App for App {
                 if ui.button(self.lang.toggle_label()).clicked() {
                     self.lang = self.lang.toggle();
                 }
-                ui.heading("mftree");
+                ui.heading("sizetree");
                 egui::ComboBox::from_label(tr(self.lang, S::Drive))
                     .selected_text(&self.drive)
                     .show_ui(ui, |ui| {
@@ -1513,7 +1513,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "mftree — disk usage analyzer",
+        "sizetree — disk usage analyzer",
         opts,
         Box::new(|cc| {
             let mut visuals = egui::Visuals::dark();

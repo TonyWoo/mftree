@@ -1,10 +1,10 @@
 [package]
-name = "mftree"
-version = "0.1.0"
+name = "sizetree"
+version = "0.2.0"
 edition = "2021"
 description = "WizTree-style disk usage analyzer in Rust — reads the NTFS MFT directly"
 license = "MIT"
-repository = "https://github.com/tonywoo/mftree"
+repository = "https://github.com/TonyWoo/sizetree"
 
 [dependencies]
 eframe = "0.36"

@@ -1,39 +1,72 @@
-# mftree
+# sizetree
 
-WizTree-style disk space analyzer written in Rust.
+A WizTree-style disk usage analyzer written in Rust. See what's eating your disk at a glance — as a sortable tree and a treemap.
 
-On Windows it reads the NTFS **Master File Table ($MFT) directly** instead of
-walking the directory tree, so a full-disk scan finishes in seconds. The UI
-shows the largest files/folders and a treemap, just like WizTree.
+On Windows it reads the NTFS `$MFT` directly (no slow directory walk — even a full drive scans in seconds). On Linux and macOS it falls back to a recursive directory scan.
 
-On other platforms it falls back to a plain recursive directory walk (useful
-for development).
+![license](https://img.shields.io/badge/license-MIT-blue)
 
-## Build
+## Features
+
+- **Fast scans** — direct `$MFT` parsing on Windows; parallel-friendly walker elsewhere
+- **Treemap view** — squarified treemap, click a block to jump to that folder in the list
+- **Sortable file/folder tables** — by name, size, or % of total; virtualized for large drives
+- **Folder drill-down** — double-click to descend, breadcrumb bar to climb back up
+- **Disk space bar** — total / free per drive, with a low-space warning under 10%
+- **CSV export** — dump the current view
+- **Right-click actions** — reveal in Explorer/Finder, move to trash, permanent delete (with confirmation)
+- **Bilingual UI** — 中文 / English toggle
+- **Cancellable scans** — stop a long scan any time
+
+## Download
+
+Grab the latest release for Windows or Linux from the
+[Releases page](https://github.com/TonyWoo/sizetree/releases).
+No installer, no dependencies — just unzip and run.
+
+> On Windows, run as Administrator so sizetree can open the raw volume for `$MFT` access.
+> Without elevation it falls back to a regular directory scan.
+
+## Build from source
 
 ```sh
 cargo build --release
+./target/release/sizetree
 ```
 
-## Run
-
-Windows: **run as Administrator** (raw disk access requires it).
+Windows GUI notes:
 
 ```sh
-./target/release/mftree
+# cross-check the Windows-only MFT code compiles (needs the target installed):
+rustup target add x86_64-pc-windows-gnu
+cargo check --target x86_64-pc-windows-gnu
 ```
 
-Pick a drive, hit **Scan**. Click a treemap block to highlight the file in the
-list; hover for the full path.
+## Usage
 
-## Layout
+1. Pick a drive (or let it default to the system drive).
+2. Hit **Scan** — watch the treemap fill in live.
+3. Click treemap blocks or double-click folders to drill down; use the breadcrumb bar to go back.
+4. Right-click any row to reveal it, trash it, or export the current view to CSV.
 
-- `src/mft.rs` — $MFT parser (boot sector → fixup → run list → FILE records →
-  `$FILE_NAME` / `$DATA`), plus path rebuilding and directory aggregation.
-- `src/treemap.rs` — squarified treemap layout.
-- `src/main.rs` — egui/eframe UI.
+## How it works
 
-## Status
+- **Windows**: opens `\\.\C:` and parses the NTFS boot sector → `$MFT` data runs →
+  file records → `$FILE_NAME` attributes, applying the update-sequence fixup and
+  preferring Win32 long names over DOS 8.3 short names.
+- **Other platforms**: recursive directory walk with symlink-loop protection.
 
-Early prototype. Tested parsing logic on synthetic MFT records; real-volume
-testing on Windows pending.
+The treemap uses the squarified layout algorithm (Bruls et al.); colors distinguish
+sibling folders rather than encoding size (area already does that).
+
+## Development
+
+```sh
+cargo fmt --all                                        # format
+cargo clippy --all-targets --locked -- -D warnings     # lint (strict)
+cargo test --locked                                    # unit tests
+```
+
+## License
+
+MIT — see [LICENSE](LICENSE).

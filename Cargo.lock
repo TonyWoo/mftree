@@ -1800,17 +1800,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mftree"
-version = "0.1.0"
-dependencies = [
- "eframe",
- "egui_extras",
- "libc",
- "trash",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2906,6 +2895,17 @@ name = "siphasher"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
+
+[[package]]
+name = "sizetree"
+version = "0.2.0"
+dependencies = [
+ "eframe",
+ "egui_extras",
+ "libc",
+ "trash",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "skrifa"

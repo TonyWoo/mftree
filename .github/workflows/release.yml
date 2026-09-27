@@ -27,14 +27,14 @@ jobs:
         run: cargo build --release --locked
       - name: package (Windows)
         if: runner.os == 'Windows'
-        run: Compress-Archive -Path target/release/mftree.exe -DestinationPath mftree-windows-x86_64.zip
+        run: Compress-Archive -Path target/release/sizetree.exe -DestinationPath sizetree-windows-x86_64.zip
       - name: package (Linux)
         if: runner.os == 'Linux'
-        run: zip -j mftree-linux-x86_64.zip target/release/mftree
+        run: zip -j sizetree-linux-x86_64.zip target/release/sizetree
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ runner.os }}-bin
-          path: mftree-*.zip
+          path: sizetree-*.zip
 
   release:
     name: create release
